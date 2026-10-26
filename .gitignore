@@ -1,0 +1,21 @@
+# Environment and secrets
+.env
+.env.*
+
+# Python cache
+__pycache__/
+*.py[cod]
+.venv/
+
+# IDE/editor
+.vscode/
+.idea/
+
+# Generated artifacts
+results/*.docx
+results/*.pdf
+*.log
+
+# Large or local-only files
+*.pdf
+*.docx
