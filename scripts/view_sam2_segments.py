@@ -8,7 +8,9 @@ import json
 import subprocess
 import sys
 import tempfile
+import threading
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 from typing import Any
 from urllib import request
@@ -98,6 +100,10 @@ class SegmentViewer(tk.Tk):
         self.rendered_bounds: tuple[int, int, int, int] | None = None
         self.current_photo: ImageTk.PhotoImage | None = None
         self.match_result_cache: dict[tuple[int, int], dict[str, Any]] = {}
+        self.searching = False
+        self.spinner_index = 0
+        self.spinner_chars = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+        self.search_thread: threading.Thread | None = None
 
         self._build_ui()
         self.bind("<Left>", lambda _event: self.show_previous())
@@ -277,6 +283,19 @@ class SegmentViewer(tk.Tk):
                 return idx
         return None
 
+    def _start_search_spinner(self):
+        if not self.searching:
+            return
+        spinner = self.spinner_chars[self.spinner_index % len(self.spinner_chars)]
+        self.results_status.config(text=f"Searching for matches {spinner}")
+        self.spinner_index += 1
+        self.after(100, self._start_search_spinner)
+
+    def _stop_search_spinner(self):
+        self.searching = False
+        self.spinner_index = 0
+        self.results_status.config(text="Select a region to match it against the texture index.")
+
     def clear_match_results(self):
         for child in self.results_inner.winfo_children():
             if child is not self.results_status:
@@ -314,16 +333,22 @@ class SegmentViewer(tk.Tk):
             title = match.get("product_name") or match.get("brand_name") or match.get("product_id") or f"Match {idx}"
             score = match.get("score")
             score_text = f"score={score}" if score is not None else "score=n/a"
-            tk.Label(match_frame, text=f"#{idx} {title} ({score_text})", justify="left", anchor="w", wraplength=260).pack(fill="x")
+            tk.Label(match_frame, text=f"#{idx} {title} ({score_text})", justify="left", anchor="w", wraplength=260, font=("TkDefaultFont", 10, "bold")).pack(fill="x")
+
+            inner = tk.Frame(match_frame)
+            inner.pack(fill="x", pady=(4, 0))
 
             texture_url = match.get("texture_url")
             if texture_url:
-                preview = self.download_thumbnail(texture_url, (100, 100))
+                preview = self.download_thumbnail(texture_url, (72, 72))
                 if preview is not None:
-                    photo = ImageTk.PhotoImage(preview)
-                    label = tk.Label(match_frame, image=photo)
+                    rgba = preview.convert("RGBA")
+                    white_bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+                    composited = Image.alpha_composite(white_bg, rgba)
+                    photo = ImageTk.PhotoImage(composited)
+                    label = tk.Label(inner, image=photo)
                     label.image = photo
-                    label.pack(side="left", padx=(0, 8), pady=4)
+                    label.pack(side="left", padx=(0, 8), pady=2)
 
             feature_lines = []
             for key in ["brand_name", "product_category", "material_type", "location", "application", "color"]:
@@ -331,8 +356,18 @@ class SegmentViewer(tk.Tk):
                 if value:
                     value_text = value if isinstance(value, str) else ", ".join(str(item) for item in value)
                     feature_lines.append(f"{key}: {value_text}")
+
+            product_url = match.get("product_url")
+            if product_url:
+                feature_lines.append(f"product: {product_url}")
+
             preview_text = "\n".join(feature_lines[:6]) if feature_lines else "No feature metadata"
-            tk.Label(match_frame, text=preview_text, justify="left", anchor="w", wraplength=220).pack(side="left", fill="both", expand=True)
+            details = tk.Label(inner, text=preview_text, justify="left", anchor="w", wraplength=220, font=("TkDefaultFont", 9))
+            details.pack(side="left", fill="both", expand=True)
+
+            if product_url:
+                details.bind("<Button-1>", lambda _event, url=product_url: webbrowser.open(url))
+                details.config(fg="blue", cursor="hand2")
 
     def on_mouse_move(self, event: tk.Event):
         hovered = self._region_at_display_position(event.x, event.y)
@@ -351,7 +386,7 @@ class SegmentViewer(tk.Tk):
         self.match_selected_region(self.current_hovered_region)
 
     def match_selected_region(self, region_index: int) -> None:
-        if region_index is None:
+        if region_index is None or self.searching:
             return
 
         entry = self.entries[self.current_index]
@@ -370,6 +405,13 @@ class SegmentViewer(tk.Tk):
         if cache_key in self.match_result_cache:
             self.display_match_results(self.match_result_cache[cache_key])
             return
+
+        self.searching = True
+        self.spinner_index = 0
+        self.clear_match_results()
+        self.results_status.config(text="Searching for matches ⠋")
+        self.results_status.pack(anchor="w", padx=8, pady=8)
+        self._start_search_spinner()
 
         mask_array = (region_masks[region_index].astype(np.uint8) * 255)
         mask_image = Image.fromarray(mask_array, mode="L")
@@ -394,22 +436,48 @@ class SegmentViewer(tk.Tk):
             str(result_path),
         ]
 
-        try:
-            completed = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        except subprocess.TimeoutExpired:
-            self.results_status.config(text="Matching timed out for this region.")
+        def worker() -> None:
+            try:
+                completed = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            except subprocess.TimeoutExpired:
+                self.after(0, lambda: self._finish_match_search(None, "Matching timed out for this region."))
+                return
+
+            if completed.returncode != 0:
+                error_text = completed.stderr.strip() or completed.stdout.strip() or "Unknown matching error."
+                self.after(0, lambda: self._finish_match_search(None, f"Matching failed:\n{error_text}"))
+                return
+
+            if not result_path.exists():
+                self.after(0, lambda: self._finish_match_search(None, "Match script did not produce a result file."))
+                return
+
+            try:
+                payload = load_json(result_path)
+            except Exception:
+                self.after(0, lambda: self._finish_match_search(None, "Unable to read the match result file."))
+                return
+
+            self.match_result_cache[cache_key] = payload
+            self.after(0, lambda: self._finish_match_search(payload, None))
+
+        self.search_thread = threading.Thread(target=worker, daemon=True)
+        self.search_thread.start()
+
+    def _finish_match_search(self, payload: dict[str, Any] | None, error_message: str | None) -> None:
+        if self.search_thread and self.search_thread.is_alive():
+            self.search_thread = None
+        self.searching = False
+        if error_message:
+            self.results_status.config(text=error_message)
+            self.results_status.pack(anchor="w", padx=8, pady=8)
             return
 
-        if completed.returncode != 0:
-            self.results_status.config(text=f"Matching failed:\n{completed.stderr.strip() or completed.stdout.strip()}")
-            return
-
-        if not result_path.exists():
+        if payload is None:
             self.results_status.config(text="Match script did not produce a result file.")
+            self.results_status.pack(anchor="w", padx=8, pady=8)
             return
 
-        payload = load_json(result_path)
-        self.match_result_cache[cache_key] = payload
         self.display_match_results(payload)
 
 

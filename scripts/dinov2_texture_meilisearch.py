@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 from urllib import error, request
@@ -123,11 +124,35 @@ def resolve_texture_path(product: dict[str, Any], texture_dir: Path, mapping_pat
     return None
 
 
-def ensure_index(host: str, api_key: str | None, index_name: str, primary_key: str = "product_id") -> None:
+def wait_for_task(host: str, api_key: str | None, task_uid: int, timeout_seconds: int = 600, poll_seconds: float = 0.5) -> None:
+    start = time.time()
+    endpoint = f"{host.rstrip('/')}/tasks/{task_uid}"
+    while True:
+        task = http_json("GET", endpoint, api_key=api_key)
+        status = task.get("status")
+        if status == "succeeded":
+            return
+        if status == "failed":
+            error_block = task.get("error")
+            raise RuntimeError(f"Meilisearch task {task_uid} failed: {error_block}")
+        if time.time() - start > timeout_seconds:
+            raise RuntimeError(f"Timed out waiting for Meilisearch task {task_uid} after {timeout_seconds}s.")
+        time.sleep(poll_seconds)
+
+
+def extract_task_uid(response: dict[str, Any], operation_name: str) -> int:
+    task_uid = response.get("taskUid")
+    if not isinstance(task_uid, int):
+        raise RuntimeError(f"{operation_name} did not return a valid taskUid: {response}")
+    return task_uid
+
+
+def ensure_index(host: str, api_key: str | None, index_name: str, primary_key: str = "product_id", vector_dimensions: int | None = None) -> None:
     endpoint = f"{host.rstrip('/')}/indexes"
     payload = {"uid": index_name, "primaryKey": primary_key}
     try:
-        http_json("POST", endpoint, payload, api_key)
+        response = http_json("POST", endpoint, payload, api_key)
+        wait_for_task(host, api_key, extract_task_uid(response, "create-index"))
     except RuntimeError as exc:
         if "already exists" not in str(exc).lower() and "index_already_exists" not in str(exc).lower():
             raise
@@ -162,7 +187,15 @@ def ensure_index(host: str, api_key: str | None, index_name: str, primary_key: s
             "exactness",
         ],
     }
-    http_json("PATCH", f"{host.rstrip('/')}/indexes/{index_name}/settings", settings, api_key)
+    if vector_dimensions is not None:
+        settings["embedders"] = {
+            "default": {
+                "source": "userProvided",
+                "dimensions": vector_dimensions,
+            }
+        }
+    response = http_json("PATCH", f"{host.rstrip('/')}/indexes/{index_name}/settings", settings, api_key)
+    wait_for_task(host, api_key, extract_task_uid(response, "update-settings"))
 
 
 def build_features(record: dict[str, Any]) -> list[str]:
@@ -210,13 +243,26 @@ def compute_embedding(image_path: Path, model: AutoModel, processor: AutoImagePr
         image.close()
 
 
+def build_product_url(brand_slug: str | None, product_slug: str | None) -> str | None:
+    brand = str(brand_slug or "").strip().strip("/")
+    product = str(product_slug or "").strip().strip("/")
+    if not brand or not product:
+        return None
+    return f"https://lightbeans.com/en/texture/{brand}/{product}"
+
+
 def build_document(product: dict[str, Any], image_path: Path, embedding: list[float]) -> dict[str, Any]:
     product_id = str(product.get("id"))
+    brand_slug = product.get("brandSlug")
+    product_slug = product.get("productSlug")
     doc = {
         "product_id": product_id,
         "id": product_id,
         "product_name": product.get("productName"),
         "brand_name": product.get("brandName"),
+        "brand_slug": brand_slug,
+        "product_slug": product_slug,
+        "product_url": build_product_url(brand_slug, product_slug),
         "product_category": as_list(product.get("productCategory")),
         "material_type": as_list(product.get("materialType")),
         "location": as_list(product.get("location")),
@@ -255,6 +301,9 @@ def search_by_image(
             "product_id",
             "product_name",
             "brand_name",
+            "brand_slug",
+            "product_slug",
+            "product_url",
             "product_category",
             "material_type",
             "location",
@@ -334,7 +383,8 @@ def main() -> int:
         embedding = compute_embedding(texture_path, image_model, image_processor, device)
         documents.append(build_document(record, texture_path, embedding))
 
-    ensure_index(args.host, args.key, args.index)
+    vector_dimensions = len(documents[0]["embedding"]) if documents else None
+    ensure_index(args.host, args.key, args.index, vector_dimensions=vector_dimensions)
     upload_documents(args.host, args.key, args.index, documents)
     print(f"Indexed {len(documents)} product texture embeddings in Meilisearch index '{args.index}'.")
     print(f"Skipped {skipped} products without a usable texture file.")

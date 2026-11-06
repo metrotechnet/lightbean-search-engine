@@ -110,12 +110,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=4, help="Number of images to process per batch.")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="Inference device.")
     parser.add_argument("--min-region-area", type=int, default=200, help="Discard masks smaller than this many pixels.")
+    parser.add_argument("--limit", type=int, default=0, help="Process only the first N images (0 = all).")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     image_paths = collect_images(args.images_dir)
+    if args.limit > 0:
+        image_paths = image_paths[: args.limit]
     if not image_paths:
         raise RuntimeError("No images found to segment.")
 

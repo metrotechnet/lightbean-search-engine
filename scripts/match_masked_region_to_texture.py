@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 from urllib import error, request
@@ -25,8 +26,9 @@ from PIL import Image
 from transformers import AutoImageProcessor, AutoModel
 
 MODEL_NAME = "facebook/dinov2-small"
-DEFAULT_INDEX = "lightbean-index"
+DEFAULT_INDEX = "lightbeans-texture-dinov2"
 TEXTURE_CDN = "https://cdn.lightbeans.com/textures/"
+PRODUCT_URL_BASE = "https://lightbeans.com/en/texture/"
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -157,6 +159,42 @@ def compute_embedding(image: Image.Image, model: AutoModel, processor: AutoImage
     return [float(value) for value in embedding.tolist()]
 
 
+def wait_for_task(host: str, api_key: str | None, task_uid: int, timeout_seconds: int = 600, poll_seconds: float = 0.5) -> None:
+    start = time.time()
+    endpoint = f"{host.rstrip('/')}/tasks/{task_uid}"
+    while True:
+        task = http_json("GET", endpoint, api_key=api_key)
+        status = task.get("status")
+        if status == "succeeded":
+            return
+        if status == "failed":
+            error_block = task.get("error")
+            raise RuntimeError(f"Meilisearch task {task_uid} failed: {error_block}")
+        if time.time() - start > timeout_seconds:
+            raise RuntimeError(f"Timed out waiting for Meilisearch task {task_uid} after {timeout_seconds}s.")
+        time.sleep(poll_seconds)
+
+
+def extract_task_uid(response: dict[str, Any], operation_name: str) -> int:
+    task_uid = response.get("taskUid")
+    if not isinstance(task_uid, int):
+        raise RuntimeError(f"{operation_name} did not return a valid taskUid: {response}")
+    return task_uid
+
+
+def configure_index_embedder(host: str, api_key: str | None, index_name: str, vector_dimensions: int) -> None:
+    settings = {
+        "embedders": {
+            "default": {
+                "source": "userProvided",
+                "dimensions": vector_dimensions,
+            }
+        }
+    }
+    response = http_json("PATCH", f"{host.rstrip('/')}/indexes/{index_name}/settings", settings, api_key)
+    wait_for_task(host, api_key, extract_task_uid(response, "update-settings"))
+
+
 def search_meilisearch(host: str, api_key: str | None, index_name: str, vector: list[float], limit: int = 5) -> dict[str, Any]:
     endpoint = f"{host.rstrip('/')}/indexes/{index_name}/search"
     payload = {
@@ -166,6 +204,8 @@ def search_meilisearch(host: str, api_key: str | None, index_name: str, vector: 
             "product_id",
             "product_name",
             "brand_name",
+            "brand_slug",
+            "product_slug",
             "product_category",
             "material_type",
             "location",
@@ -175,8 +215,16 @@ def search_meilisearch(host: str, api_key: str | None, index_name: str, vector: 
             "image_path",
         ],
         "hybrid": {"semanticRatio": 1.0, "embedder": "default"},
+        "showRankingScore": True,
     }
-    return http_json("POST", endpoint, payload, api_key)
+    try:
+        return http_json("POST", endpoint, payload, api_key)
+    except RuntimeError as exc:
+        message = str(exc)
+        if "Cannot find embedder with name `default`" not in message and "invalid_search_embedder" not in message:
+            raise
+        configure_index_embedder(host, api_key, index_name, len(vector))
+        return http_json("POST", endpoint, payload, api_key)
 
 
 def build_texture_url(preview_path: str | None) -> str | None:
@@ -190,8 +238,19 @@ def build_texture_url(preview_path: str | None) -> str | None:
     return urljoin(TEXTURE_CDN, normalized.lstrip("/"))
 
 
+def build_product_url(brand_slug: str | None, product_slug: str | None) -> str | None:
+    brand = str(brand_slug or "").strip().strip("/")
+    product = str(product_slug or "").strip().strip("/")
+    if not brand or not product:
+        return None
+    return f"{PRODUCT_URL_BASE.rstrip('/')}/{brand}/{product}"
+
+
 def format_match(hit: dict[str, Any], rank: int) -> dict[str, Any]:
     preview_path = hit.get("preview_path") or hit.get("previewPath")
+    brand_slug = hit.get("brand_slug") or hit.get("brandSlug")
+    product_slug = hit.get("product_slug") or hit.get("productSlug")
+    product_url = build_product_url(brand_slug, product_slug)
     return {
         "rank": rank,
         "product_id": hit.get("product_id") or hit.get("id"),
@@ -202,6 +261,9 @@ def format_match(hit: dict[str, Any], rank: int) -> dict[str, Any]:
         "location": hit.get("location"),
         "application": hit.get("application"),
         "color": hit.get("color"),
+        "brand_slug": brand_slug,
+        "product_slug": product_slug,
+        "product_url": product_url,
         "preview_path": preview_path,
         "texture_url": build_texture_url(preview_path),
         "score": hit.get("score"),
