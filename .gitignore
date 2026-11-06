@@ -12,10 +12,17 @@ __pycache__/
 .idea/
 
 # Generated artifacts
-results/*.docx
-results/*.pdf
 *.log
+DINOv2_*.json
+SigLIP2_*.json
+*_results.json
+attribute_labels.json
+ground_truth.json
+evaluation_results_sample.json
 
 # Large or local-only files
 *.pdf
 *.docx
+images/
+texture/
+results/
