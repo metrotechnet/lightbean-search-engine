@@ -14,12 +14,15 @@ import webbrowser
 from pathlib import Path
 from typing import Any
 from urllib import request
+from urllib.parse import urljoin
 
 import numpy as np
 from PIL import Image, ImageTk
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+GROUND_TRUTH_PATH = PROJECT_ROOT / "ground_truth.json"
+PRODUCT_EXPORT_PATH = PROJECT_ROOT / "data" / "platform-products-production-v2-en.json"
 
 PALETTE = [
     (231, 76, 60),
@@ -54,6 +57,17 @@ def resolve_path(path_value: str, metadata_path: Path) -> Path:
             return candidate
 
     return path
+
+
+def build_texture_url(preview_path: str | None) -> str | None:
+    if not preview_path:
+        return None
+    normalized = str(preview_path).strip()
+    if not normalized:
+        return None
+    if normalized.startswith("http://") or normalized.startswith("https://"):
+        return normalized
+    return urljoin("https://cdn.lightbeans.com/textures/", normalized.lstrip("/"))
 
 
 def build_overlay(
@@ -104,6 +118,8 @@ class SegmentViewer(tk.Tk):
         self.spinner_index = 0
         self.spinner_chars = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
         self.search_thread: threading.Thread | None = None
+        self.ground_truth_map = self._load_ground_truth_map()
+        self.product_catalog = self._load_product_catalog()
 
         self._build_ui()
         self.bind("<Left>", lambda _event: self.show_previous())
@@ -146,19 +162,75 @@ class SegmentViewer(tk.Tk):
         self.results_header = tk.Label(self.results_panel, text="Region Matches", font=("TkDefaultFont", 11, "bold"))
         self.results_header.pack(fill="x", padx=10, pady=(10, 8))
 
-        self.results_scroll = tk.Scrollbar(self.results_panel, orient="vertical")
+        self.results_inner = tk.Frame(self.results_panel)
+        self.results_inner.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        self.real_match_frame = tk.Frame(self.results_inner, bd=1, relief="solid", padx=6, pady=6)
+        self.real_match_frame.pack(fill="x", pady=(0, 8))
+
+        self.real_match_title = tk.Label(self.real_match_frame, text="Real match", justify="left", anchor="w", wraplength=300, font=("TkDefaultFont", 10, "bold"))
+        self.real_match_title.pack(fill="x", pady=(0, 4))
+
+        self.real_match_body = tk.Frame(self.real_match_frame, padx=0, pady=0)
+        self.real_match_body.pack(fill="x")
+
+        self.match_results_panel = tk.Frame(self.results_inner, bd=1, relief="solid")
+        self.match_results_panel.pack(fill="both", expand=True)
+
+        self.results_status = tk.Label(self.match_results_panel, text="Select a region to match it against the texture index.", justify="left", wraplength=300)
+        self.results_status.pack(anchor="w", padx=8, pady=(8, 6))
+
+        self.results_scroll = tk.Scrollbar(self.match_results_panel, orient="vertical")
         self.results_scroll.pack(side="right", fill="y")
 
-        self.results_canvas = tk.Canvas(self.results_panel, yscrollcommand=self.results_scroll.set)
-        self.results_canvas.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=(0, 10))
+        self.results_canvas = tk.Canvas(self.match_results_panel, yscrollcommand=self.results_scroll.set)
+        self.results_canvas.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=(0, 8))
         self.results_scroll.config(command=self.results_canvas.yview)
 
-        self.results_inner = tk.Frame(self.results_canvas)
-        self.results_canvas.create_window((0, 0), window=self.results_inner, anchor="nw")
-        self.results_inner.bind("<Configure>", lambda event: self.results_canvas.configure(scrollregion=self.results_canvas.bbox("all")))
+        self.search_results_frame = tk.Frame(self.results_canvas)
+        self.results_canvas.create_window((0, 0), window=self.search_results_frame, anchor="nw")
+        self.search_results_frame.bind("<Configure>", lambda event: self.results_canvas.configure(scrollregion=self.results_canvas.bbox("all")))
 
-        self.results_status = tk.Label(self.results_inner, text="Select a region to match it against the texture index.", justify="left", wraplength=300)
-        self.results_status.pack(anchor="w", padx=8, pady=8)
+    def _load_ground_truth_map(self) -> dict[str, str]:
+        if not GROUND_TRUTH_PATH.exists():
+            return {}
+        payload = load_json(GROUND_TRUTH_PATH)
+        return payload if isinstance(payload, dict) else {}
+
+    def _load_product_catalog(self) -> dict[str, dict[str, Any]]:
+        if not PRODUCT_EXPORT_PATH.exists():
+            return {}
+        payload = load_json(PRODUCT_EXPORT_PATH)
+        if not isinstance(payload, list):
+            return {}
+        catalog: dict[str, dict[str, Any]] = {}
+        for record in payload:
+            if isinstance(record, dict) and record.get("id") is not None:
+                catalog[str(record["id"])] = record
+        return catalog
+
+    def _resolve_current_ground_truth_product(self) -> dict[str, Any] | None:
+        entry = self.entries[self.current_index]
+        image_rel = str(entry.get("image", ""))
+        candidates = []
+        if image_rel:
+            candidates.extend([
+                Path(image_rel).name,
+                image_rel,
+                str(Path(image_rel).as_posix()),
+            ])
+        candidates.extend([
+            str(Path(image_rel).name),
+            str(Path(image_rel).as_posix()),
+        ])
+        seen = set()
+        for candidate in candidates:
+            if candidate and candidate not in seen:
+                seen.add(candidate)
+                product_id = self.ground_truth_map.get(candidate)
+                if product_id:
+                    return self.product_catalog.get(str(product_id))
+        return None
 
     def show_previous(self):
         if self.current_index > 0:
@@ -183,8 +255,67 @@ class SegmentViewer(tk.Tk):
         )
         self.current_hovered_region = None
         self.results_status.config(text="Select a region to match it against the texture index.")
+        self.render_real_match()
         self.clear_match_results()
         self.render_current()
+
+    def render_real_match(self) -> None:
+        for child in self.real_match_body.winfo_children():
+            child.destroy()
+
+        product = self._resolve_current_ground_truth_product()
+        if product is None:
+            tk.Label(self.real_match_body, text="No ground-truth match found for this image.", justify="left", anchor="w", wraplength=280).pack(fill="x")
+            return
+
+        product_name = product.get("productName") or "Unknown product"
+        brand_name = product.get("brandName") or "Unknown brand"
+        product_url = None
+        brand_slug = product.get("brandSlug")
+        product_slug = product.get("productSlug")
+        if brand_slug and product_slug:
+            product_url = f"https://lightbeans.com/en/texture/{brand_slug}/{product_slug}"
+
+        texture_url = None
+        preview_path = product.get("previewPath")
+        if preview_path:
+            texture_url = build_texture_url(str(preview_path)) if preview_path else None
+
+        row = tk.Frame(self.real_match_body)
+        row.pack(fill="x")
+
+        if texture_url:
+            preview = self.download_thumbnail(texture_url, (72, 72))
+            if preview is not None:
+                rgba = preview.convert("RGBA")
+                white_bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+                composited = Image.alpha_composite(white_bg, rgba)
+                photo = ImageTk.PhotoImage(composited)
+                image_label = tk.Label(row, image=photo)
+                image_label.image = photo
+                image_label.pack(side="left", padx=(0, 8), pady=2)
+
+        content = tk.Frame(row)
+        content.pack(side="left", fill="both", expand=True)
+
+        title = tk.Label(content, text=f"{brand_name} — {product_name}", justify="left", anchor="w", wraplength=200, font=("TkDefaultFont", 10, "bold"))
+        title.pack(fill="x")
+
+        details = []
+        if product.get("productCategory"):
+            details.append(f"Category: {', '.join(str(v) for v in product.get('productCategory', []))}")
+        if product.get("materialType"):
+            details.append(f"Material: {', '.join(str(v) for v in product.get('materialType', []))}")
+        if product.get("color"):
+            details.append(f"Color: {', '.join(str(v) for v in product.get('color', []))}")
+        if product_url:
+            details.append(f"Link: {product_url}")
+        if details:
+            info = tk.Label(content, text="\n".join(details), justify="left", anchor="w", wraplength=220, font=("TkDefaultFont", 9))
+            info.pack(fill="x", pady=(4, 0))
+            if product_url:
+                info.bind("<Button-1>", lambda _event, url=product_url: webbrowser.open(url))
+                info.config(fg="blue", cursor="hand2")
 
     def _load_entry_assets(self, entry_index: int) -> dict[str, Any]:
         cached = self.entry_assets_cache.get(entry_index)
@@ -297,10 +428,9 @@ class SegmentViewer(tk.Tk):
         self.results_status.config(text="Select a region to match it against the texture index.")
 
     def clear_match_results(self):
-        for child in self.results_inner.winfo_children():
-            if child is not self.results_status:
-                child.destroy()
-        self.results_inner.update_idletasks()
+        for child in self.search_results_frame.winfo_children():
+            child.destroy()
+        self.search_results_frame.update_idletasks()
 
     def download_thumbnail(self, url: str, size: tuple[int, int]) -> Image.Image | None:
         try:
@@ -320,20 +450,27 @@ class SegmentViewer(tk.Tk):
         matches = payload.get("matches", [])
         if not isinstance(matches, list) or not matches:
             self.results_status.config(text="No matching textures found for this region.")
-            self.results_status.pack(anchor="w", padx=8, pady=8)
+            self.results_status.pack(anchor="w", padx=8, pady=(8, 6))
             return
 
         self.results_status.config(text=f"Top {len(matches)} matches for selected region", justify="left", wraplength=300)
-        self.results_status.pack(anchor="w", padx=8, pady=8)
+        self.results_status.pack(anchor="w", padx=8, pady=(8, 6))
 
         for idx, match in enumerate(matches, start=1):
-            match_frame = tk.Frame(self.results_inner, bd=1, relief="solid", padx=6, pady=6)
+            match_frame = tk.Frame(self.search_results_frame, bd=1, relief="solid", padx=6, pady=6)
             match_frame.pack(fill="x", padx=8, pady=6)
 
             title = match.get("product_name") or match.get("brand_name") or match.get("product_id") or f"Match {idx}"
             score = match.get("score")
-            score_text = f"score={score}" if score is not None else "score=n/a"
-            tk.Label(match_frame, text=f"#{idx} {title} ({score_text})", justify="left", anchor="w", wraplength=260, font=("TkDefaultFont", 10, "bold")).pack(fill="x")
+            if score is not None:
+                try:
+                    score_value = float(score)
+                    score_label = f"score={score_value:.4f}"
+                except (TypeError, ValueError):
+                    score_label = f"score={score}"
+            else:
+                score_label = "score=n/a"
+            tk.Label(match_frame, text=f"#{idx} {title} ({score_label})", justify="left", anchor="w", wraplength=260, font=("TkDefaultFont", 10, "bold")).pack(fill="x")
 
             inner = tk.Frame(match_frame)
             inner.pack(fill="x", pady=(4, 0))
@@ -410,7 +547,7 @@ class SegmentViewer(tk.Tk):
         self.spinner_index = 0
         self.clear_match_results()
         self.results_status.config(text="Searching for matches ⠋")
-        self.results_status.pack(anchor="w", padx=8, pady=8)
+        self.results_status.pack(anchor="w", padx=8, pady=(8, 6))
         self._start_search_spinner()
 
         mask_array = (region_masks[region_index].astype(np.uint8) * 255)
@@ -431,7 +568,7 @@ class SegmentViewer(tk.Tk):
             "--mask",
             str(mask_path),
             "--limit",
-            "5",
+            "10",
             "--output",
             str(result_path),
         ]
@@ -470,12 +607,12 @@ class SegmentViewer(tk.Tk):
         self.searching = False
         if error_message:
             self.results_status.config(text=error_message)
-            self.results_status.pack(anchor="w", padx=8, pady=8)
+            self.results_status.pack(anchor="w", padx=8, pady=(8, 6))
             return
 
         if payload is None:
             self.results_status.config(text="Match script did not produce a result file.")
-            self.results_status.pack(anchor="w", padx=8, pady=8)
+            self.results_status.pack(anchor="w", padx=8, pady=(8, 6))
             return
 
         self.display_match_results(payload)

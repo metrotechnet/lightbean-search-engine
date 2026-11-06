@@ -86,7 +86,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default=env_values.get("MEILI_HOST") or os.getenv("MEILI_HOST") or "http://localhost:7700", help="Meilisearch host.")
     parser.add_argument("--key", default=env_values.get("MEILI_KEY") or os.getenv("MEILI_KEY"), help="Meilisearch API key.")
     parser.add_argument("--index", default=env_values.get("MEILI_INDEX") or os.getenv("MEILI_INDEX") or DEFAULT_INDEX, help="Meilisearch index to search.")
-    parser.add_argument("--limit", type=int, default=5, help="Number of matches to return.")
+    parser.add_argument("--limit", type=int, default=10, help="Number of matches to return.")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"], help="Device for DINOv2 inference.")
     parser.add_argument("--output", type=Path, help="Optional JSON file to save the result.")
     args = parser.parse_args()
@@ -195,7 +195,7 @@ def configure_index_embedder(host: str, api_key: str | None, index_name: str, ve
     wait_for_task(host, api_key, extract_task_uid(response, "update-settings"))
 
 
-def search_meilisearch(host: str, api_key: str | None, index_name: str, vector: list[float], limit: int = 5) -> dict[str, Any]:
+def search_meilisearch(host: str, api_key: str | None, index_name: str, vector: list[float], limit: int = 10) -> dict[str, Any]:
     endpoint = f"{host.rstrip('/')}/indexes/{index_name}/search"
     payload = {
         "vector": vector,
@@ -251,6 +251,17 @@ def format_match(hit: dict[str, Any], rank: int) -> dict[str, Any]:
     brand_slug = hit.get("brand_slug") or hit.get("brandSlug")
     product_slug = hit.get("product_slug") or hit.get("productSlug")
     product_url = build_product_url(brand_slug, product_slug)
+    score = (
+        hit.get("score")
+        if hit.get("score") is not None
+        else hit.get("rankingScore")
+        if hit.get("rankingScore") is not None
+        else hit.get("_rankingScore")
+        if hit.get("_rankingScore") is not None
+        else hit.get("similarity")
+        if hit.get("similarity") is not None
+        else hit.get("distance")
+    )
     return {
         "rank": rank,
         "product_id": hit.get("product_id") or hit.get("id"),
@@ -266,7 +277,8 @@ def format_match(hit: dict[str, Any], rank: int) -> dict[str, Any]:
         "product_url": product_url,
         "preview_path": preview_path,
         "texture_url": build_texture_url(preview_path),
-        "score": hit.get("score"),
+        "score": score,
+        "ranking_score": hit.get("rankingScore") or hit.get("_rankingScore"),
     }
 
 
