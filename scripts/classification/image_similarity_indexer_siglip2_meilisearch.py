@@ -404,7 +404,7 @@ def evaluate_similarity(
 
 
 def parse_args() -> argparse.Namespace:
-    project_root = Path(__file__).resolve().parent.parent
+    project_root = Path(__file__).resolve().parents[2]
     env_values = load_env(project_root / ".env")
 
     parser = argparse.ArgumentParser(
@@ -427,7 +427,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    project_root = Path(__file__).resolve().parent.parent
+    project_root = Path(__file__).resolve().parents[2]
 
     split = load_json(project_root / args.split)
     if not isinstance(split, dict):

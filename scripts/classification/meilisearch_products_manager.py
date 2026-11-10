@@ -2,9 +2,9 @@
 """Create a Meilisearch index from Lightbeans product exports and support embedding-based searches.
 
 Examples:
-  python scripts/meilisearch_products.py create-index --host http://localhost:7700 --key <MEILI_KEY>
-  python scripts/meilisearch_products.py search --host http://localhost:7700 --key <MEILI_KEY> --query "terracotta wall tile" --limit 10
-  python scripts/meilisearch_products.py search --host http://localhost:7700 --key <MEILI_KEY> --query "green tile" --use-embedding --limit 10
+  python scripts/classification/meilisearch_products_manager.py create-index --host http://localhost:7700 --key <MEILI_KEY>
+  python scripts/classification/meilisearch_products_manager.py search --host http://localhost:7700 --key <MEILI_KEY> --query "terracotta wall tile" --limit 10
+  python scripts/classification/meilisearch_products_manager.py search --host http://localhost:7700 --key <MEILI_KEY> --query "green tile" --use-embedding --limit 10
 """
 
 from __future__ import annotations
@@ -187,7 +187,7 @@ def search_with_embedding(host: str, api_key: str | None, index_name: str, query
 
 
 def get_env_defaults() -> dict[str, str]:
-    project_root = Path(__file__).resolve().parent.parent
+    project_root = Path(__file__).resolve().parents[2]
     return load_env(project_root / ".env")
 
 
@@ -225,7 +225,7 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
-    project_root = Path(__file__).resolve().parent.parent
+    project_root = Path(__file__).resolve().parents[2]
     env_values = load_env(project_root / ".env")
     if not args.key:
         args.key = env_values.get("MEILI_KEY") or os.getenv("MEILI_KEY")

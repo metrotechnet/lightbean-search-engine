@@ -22,10 +22,10 @@ from PIL import Image
 from transformers import AutoImageProcessor, AutoModel
 
 MODEL_NAME = "facebook/dinov2-small"
-DEFAULT_PRODUCT_EXPORT = "data/platform-products-production-v2-en.json"
-DEFAULT_TEXTURE_DIR = "texture"
-DEFAULT_MAPPING_PATH = "texture/texture_product_mapping.json"
-DEFAULT_INDEX = "lightbeans-texture-dinov2"
+DEFAULT_PRODUCT_EXPORT = "texture/lightbeans_main_page_textures.json"
+DEFAULT_TEXTURE_DIR = "texture/main_page"
+MEILI_INDEX = "lightbeans-texture2-dinov2"
+DEFAULT_INDEX = MEILI_INDEX
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -102,6 +102,22 @@ def load_mapping(mapping_path: Path | None) -> dict[str, Any]:
 
 
 def resolve_texture_path(product: dict[str, Any], texture_dir: Path, mapping_path: Path | None) -> Path | None:
+    image_name = product.get("image_name")
+    if isinstance(image_name, str) and image_name.strip():
+        for candidate_dir in [texture_dir, texture_dir / "main_page", texture_dir.parent / "main_page"]:
+            candidate = candidate_dir / image_name.strip()
+            if candidate.exists():
+                return candidate
+
+    image_url = product.get("image_url")
+    if isinstance(image_url, str) and image_url.strip():
+        filename = image_url.rstrip("/").split("/")[-1]
+        if filename:
+            for candidate_dir in [texture_dir, texture_dir / "main_page", texture_dir.parent / "main_page"]:
+                candidate = candidate_dir / filename
+                if candidate.exists():
+                    return candidate
+
     product_id = product.get("id")
     if product_id is not None:
         mapping = load_mapping(mapping_path)
@@ -159,23 +175,17 @@ def ensure_index(host: str, api_key: str | None, index_name: str, primary_key: s
 
     settings = {
         "searchableAttributes": [
-            "product_name",
-            "brand_name",
-            "product_category",
-            "material_type",
-            "location",
-            "application",
-            "color",
+            "name",
+            "link",
+            "image_url",
+            "image_name",
         ],
         "filterableAttributes": [
             "product_id",
-            "brand_name",
-            "product_category",
-            "material_type",
-            "location",
-            "application",
-            "color",
-            "locale",
+            "name",
+            "link",
+            "image_url",
+            "image_name",
         ],
         "sortableAttributes": ["product_id"],
         "rankingRules": [
@@ -200,19 +210,21 @@ def ensure_index(host: str, api_key: str | None, index_name: str, primary_key: s
 
 def build_features(record: dict[str, Any]) -> list[str]:
     feature_values: list[str] = []
-    for field in [
-        "productName",
-        "brandName",
-        "productCategory",
-        "materialType",
-        "location",
-        "application",
-        "color",
-        "locale",
-    ]:
-        for value in as_list(record.get(field)):
-            feature_values.append(value)
+    for field in ["name", "link", "image_url", "image_name"]:
+        value = record.get(field)
+        if isinstance(value, str) and value.strip():
+            feature_values.append(value.strip())
     return feature_values
+
+
+def sanitize_meilisearch_id(value: Any) -> str:
+    text = str(value or "").strip()
+    text = text.replace(".", "_")
+    text = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in text)
+    text = text.strip("_")
+    if not text:
+        raise ValueError(f"Could not create a valid Meilisearch document ID from value {value!r}")
+    return text[:511]
 
 
 def l2_normalize(vector: np.ndarray) -> np.ndarray:
@@ -252,24 +264,19 @@ def build_product_url(brand_slug: str | None, product_slug: str | None) -> str |
 
 
 def build_document(product: dict[str, Any], image_path: Path, embedding: list[float]) -> dict[str, Any]:
-    product_id = str(product.get("id"))
-    brand_slug = product.get("brandSlug")
-    product_slug = product.get("productSlug")
+    raw_product_id = product.get("id") or product.get("image_name") or product.get("link") or image_path.stem
+    product_id = sanitize_meilisearch_id(raw_product_id)
+    product_name = product.get("name")
+    product_url = product.get("link")
+    image_url = product.get("image_url") or ""
+    image_name = product.get("image_name") or image_path.name
     doc = {
         "product_id": product_id,
         "id": product_id,
-        "product_name": product.get("productName"),
-        "brand_name": product.get("brandName"),
-        "brand_slug": brand_slug,
-        "product_slug": product_slug,
-        "product_url": build_product_url(brand_slug, product_slug),
-        "product_category": as_list(product.get("productCategory")),
-        "material_type": as_list(product.get("materialType")),
-        "location": as_list(product.get("location")),
-        "application": as_list(product.get("application")),
-        "color": as_list(product.get("color")),
-        "locale": product.get("locale"),
-        "preview_path": product.get("previewPath"),
+        "name": product_name,
+        "link": product_url,
+        "image_url": image_url,
+        "image_name": image_name,
         "image_path": image_path.as_posix(),
         "features": build_features(product),
         "embedding": embedding,
@@ -280,7 +287,9 @@ def build_document(product: dict[str, Any], image_path: Path, embedding: list[fl
 
 def upload_documents(host: str, api_key: str | None, index_name: str, documents: list[dict[str, Any]]) -> None:
     endpoint = f"{host.rstrip('/')}/indexes/{index_name}/documents"
-    http_json("POST", endpoint, documents, api_key)
+    response = http_json("POST", endpoint, documents, api_key)
+    task_uid = extract_task_uid(response, "upload-documents")
+    wait_for_task(host, api_key, task_uid)
 
 
 def search_by_image(
@@ -299,16 +308,10 @@ def search_by_image(
         "limit": limit,
         "attributesToRetrieve": [
             "product_id",
-            "product_name",
-            "brand_name",
-            "brand_slug",
-            "product_slug",
-            "product_url",
-            "product_category",
-            "material_type",
-            "location",
-            "application",
-            "color",
+            "name",
+            "link",
+            "image_url",
+            "image_name",
             "image_path",
         ],
         "hybrid": {"semanticRatio": 1.0, "embedder": "default"},
@@ -317,21 +320,100 @@ def search_by_image(
     return http_json("POST", endpoint, payload, api_key)
 
 
+def search_meilisearch(host: str, api_key: str | None, index_name: str, vector: list[float], limit: int = 10) -> dict[str, Any]:
+    endpoint = f"{host.rstrip('/')}/indexes/{index_name}/search"
+    payload = {
+        "vector": vector,
+        "limit": limit,
+        "attributesToRetrieve": [
+            "product_id",
+            "name",
+            "link",
+            "image_url",
+            "image_name",
+            "image_path",
+            "preview_path",
+            "product_url",
+            "brand_slug",
+            "product_slug",
+        ],
+        "hybrid": {"semanticRatio": 1.0, "embedder": "default"},
+        "showRankingScore": True,
+    }
+    return http_json("POST", endpoint, payload, api_key)
+
+
+def format_match_for_viewer(hit: dict[str, Any], rank: int) -> dict[str, Any]:
+    preview_path = hit.get("preview_path") or hit.get("previewPath")
+    image_url = hit.get("image_url") or hit.get("imageUrl") or preview_path
+    product_url = hit.get("link") or hit.get("product_url") or hit.get("productUrl")
+    if not product_url:
+        brand_slug = hit.get("brand_slug") or hit.get("brandSlug")
+        product_slug = hit.get("product_slug") or hit.get("productSlug")
+        product_url = build_product_url(brand_slug, product_slug)
+    score = (
+        hit.get("score")
+        if hit.get("score") is not None
+        else hit.get("rankingScore")
+        if hit.get("rankingScore") is not None
+        else hit.get("_rankingScore")
+        if hit.get("_rankingScore") is not None
+        else hit.get("similarity")
+        if hit.get("similarity") is not None
+        else hit.get("distance")
+    )
+    return {
+        "rank": rank,
+        "product_id": hit.get("product_id") or hit.get("id"),
+        "name": hit.get("name") or hit.get("product_name") or hit.get("productName"),
+        "link": product_url,
+        "image_url": image_url,
+        "image_name": hit.get("image_name") or hit.get("imageName"),
+        "product_url": product_url,
+        "preview_path": preview_path,
+        "texture_url": image_url,
+        "score": score,
+        "ranking_score": hit.get("rankingScore") or hit.get("_rankingScore"),
+    }
+
+
+def search_by_image_for_viewer(
+    host: str,
+    api_key: str | None,
+    index_name: str,
+    image_path: Path,
+    model: AutoModel,
+    processor: AutoImageProcessor,
+    device: str,
+    limit: int = 10,
+) -> dict[str, Any]:
+    vector = compute_embedding(image_path, model, processor, device)
+    result = search_meilisearch(host, api_key, index_name, vector, limit=limit)
+    hits = result.get("hits", []) if isinstance(result, dict) else []
+    matches = [format_match_for_viewer(hit, idx) for idx, hit in enumerate(hits[:limit], start=1)]
+    return {
+        "image": str(image_path),
+        "embedding_dim": len(vector),
+        "matches": matches,
+    }
+
+
 def parse_args() -> argparse.Namespace:
-    project_root = Path(__file__).resolve().parents[1]
+    project_root = Path(__file__).resolve().parents[2]
     env_values = load_env(project_root / ".env")
     parser = argparse.ArgumentParser(description="Index DINOv2 texture embeddings into Meilisearch.")
     parser.add_argument("--product-export", type=Path, default=Path(DEFAULT_PRODUCT_EXPORT), help="Product export JSON file.")
     parser.add_argument("--textures-dir", type=Path, default=Path(DEFAULT_TEXTURE_DIR), help="Directory containing downloaded texture files.")
-    parser.add_argument("--mapping-json", type=Path, default=Path(DEFAULT_MAPPING_PATH), help="Texture-to-product mapping JSON generated by download_texture_images.py.")
+    parser.add_argument("--mapping-json", type=Path, default=None, help="Optional file-to-product mapping JSON for legacy texture exports.")
     parser.add_argument("--host", default=env_values.get("MEILI_HOST") or os.getenv("MEILI_HOST") or "http://localhost:7700", help="Meilisearch host.")
     parser.add_argument("--key", default=env_values.get("MEILI_KEY") or os.getenv("MEILI_KEY"), help="Meilisearch API key.")
-    parser.add_argument("--index", default=env_values.get("MEILI_INDEX") or os.getenv("MEILI_INDEX") or DEFAULT_INDEX, help="Target Meilisearch index name.")
+    parser.add_argument("--index", default=env_values.get("MEILI_INDEX") or os.getenv("MEILI_INDEX") or MEILI_INDEX, help="Target Meilisearch index name.")
     parser.add_argument("--limit", type=int, default=0, help="Process only the first N products (0 = all).")
     parser.add_argument("--batch-size", type=int, default=8, help="Image batch size for DINOv2 inference.")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"], help="Device for DINOv2 inference.")
     parser.add_argument("--query-image", type=Path, help="Optional image path used to run a vector search after indexing.")
     parser.add_argument("--search-limit", type=int, default=10, help="Number of hits to return from the optional vector search.")
+    parser.add_argument("--search-output", type=Path, help="Optional output JSON path for viewer-compatible search payload.")
     args = parser.parse_args()
     if env_values.get("HF_TOKEN"):
         os.environ["HF_TOKEN"] = env_values["HF_TOKEN"]
@@ -371,9 +453,11 @@ def main() -> int:
     documents: list[dict[str, Any]] = []
     skipped = 0
     for record in products:
-        product_id = record.get("id")
+        product_id = record.get("id") or record.get("image_name") or record.get("link") or record.get("image_url")
         if product_id is None:
             continue
+        if "id" not in record and product_id is not None:
+            record["id"] = sanitize_meilisearch_id(product_id)
 
         texture_path = resolve_texture_path(record, args.textures_dir, args.mapping_json)
         if texture_path is None or not texture_path.exists():
@@ -392,7 +476,7 @@ def main() -> int:
     if args.query_image:
         if not args.query_image.exists():
             raise FileNotFoundError(f"Query image not found: {args.query_image}")
-        result = search_by_image(
+        search_payload = search_by_image_for_viewer(
             args.host,
             args.key,
             args.index,
@@ -402,7 +486,11 @@ def main() -> int:
             device,
             limit=args.search_limit,
         )
-        print(json.dumps(result, ensure_ascii=False, indent=2)[:4000])
+        rendered = json.dumps(search_payload, ensure_ascii=False, indent=2)
+        if args.search_output:
+            args.search_output.parent.mkdir(parents=True, exist_ok=True)
+            args.search_output.write_text(rendered + "\n", encoding="utf-8")
+        print(rendered[:4000])
 
     return 0
 

@@ -199,7 +199,7 @@ def evaluate_image(
 
 
 def main() -> int:
-    project_root = Path(__file__).resolve().parent.parent
+    project_root = Path(__file__).resolve().parents[2]
     env_values = load_env(project_root / ".env")
 
     parser = argparse.ArgumentParser(description="Evaluate Meilisearch retrieval quality against the image prediction file and product ground truth.")

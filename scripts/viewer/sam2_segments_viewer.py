@@ -14,15 +14,36 @@ import webbrowser
 from pathlib import Path
 from typing import Any
 from urllib import request
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import numpy as np
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageTk
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 GROUND_TRUTH_PATH = PROJECT_ROOT / "ground_truth.json"
 PRODUCT_EXPORT_PATH = PROJECT_ROOT / "data" / "platform-products-production-v2-en.json"
+METHOD_INDEX_MAP = {
+    "dinov2": "lightbeans-texture2-dinov2",
+    "dinov3": "lightbeans-texture2-dinov3-patches",
+    "gram": "lightbeans-texture2-texture-analysis",
+    "hsi": "lightbeans-texture2-hsi",
+    "hsi_dinov2": "lightbeans-texture2-dinov2",
+    "perspective": "lightbeans-texture2-dinov2-gradient-perspective",
+    "dinov2_texture_faiss": "lightbeans-texture2-dinov2",
+}
+METHOD_LABELS = {
+    "dinov2": "DINOv2",
+    "dinov3": "DINOv3",
+    "gram": "Gram matrix",
+    "hsi": "HSI",
+    "hsi_dinov2": "HSI -> DINOv2",
+    "perspective": "Perspective gradient",
+    "dinov2_texture_faiss": "DINOv2 texture stats (FAISS)",
+}
+METHOD_HSI_PREFILTER_INDEX_MAP = {
+    "hsi_dinov2": "lightbeans-texture2-hsi",
+}
 
 PALETTE = [
     (231, 76, 60),
@@ -70,6 +91,47 @@ def build_texture_url(preview_path: str | None) -> str | None:
     return urljoin("https://cdn.lightbeans.com/textures/", normalized.lstrip("/"))
 
 
+def texture_url_key(url: str | None) -> str | None:
+    if not url:
+        return None
+    normalized = str(url).strip()
+    if not normalized:
+        return None
+    parsed = urlparse(normalized)
+    path = parsed.path or normalized
+    marker = "/texture/"
+    marker_index = path.find(marker)
+    if marker_index < 0:
+        return None
+    suffix = path[marker_index + len(marker) :].strip().strip("/")
+    if not suffix:
+        return None
+    return suffix.lower()
+
+
+def resolve_product_url(record: dict[str, Any] | None) -> str | None:
+    if not isinstance(record, dict):
+        return None
+    direct_url = record.get("link") or record.get("product_url") or record.get("productUrl")
+    if direct_url:
+        return str(direct_url)
+    brand_slug = record.get("brandSlug") or record.get("brand_slug")
+    product_slug = record.get("productSlug") or record.get("product_slug")
+    if brand_slug and product_slug:
+        return f"https://lightbeans.com/en/texture/{brand_slug}/{product_slug}"
+    return None
+
+
+def as_display_list(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return ", ".join(str(v) for v in value if str(v).strip())
+    if isinstance(value, tuple):
+        return ", ".join(str(v) for v in value if str(v).strip())
+    return str(value)
+
+
 def build_overlay(
     base_image: Image.Image,
     region_masks: list[np.ndarray],
@@ -89,6 +151,55 @@ def build_overlay(
 
     composed = Image.alpha_composite(base_rgba, overlay)
     return composed.convert("RGB")
+
+
+def extract_max_fitting_bbox(mask: np.ndarray) -> tuple[int, int, int, int]:
+    binary = mask.astype(bool)
+    if not np.any(binary):
+        raise ValueError("Mask is empty; no non-zero pixels were found.")
+
+    height, width = binary.shape
+    heights = np.zeros(width, dtype=np.int32)
+    best_area = 0
+    best_bbox = (0, 0, 1, 1)
+
+    for row_idx in range(height):
+        row = binary[row_idx]
+        heights = np.where(row, heights + 1, 0)
+        stack: list[tuple[int, int]] = []
+        for col_idx in range(width + 1):
+            current_height = int(heights[col_idx]) if col_idx < width else 0
+            start = col_idx
+            while stack and stack[-1][1] > current_height:
+                left_col, popped_height = stack.pop()
+                area = popped_height * (col_idx - left_col)
+                if area > best_area:
+                    x1 = left_col
+                    x2 = col_idx
+                    y2 = row_idx + 1
+                    y1 = y2 - popped_height
+                    best_bbox = (x1, y1, x2, y2)
+                    best_area = area
+                start = left_col
+            if not stack or stack[-1][1] < current_height:
+                stack.append((start, current_height))
+
+    return best_bbox
+
+
+def square_subset_from_bbox(bbox: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = bbox
+    width = x2 - x1
+    height = y2 - y1
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Invalid bbox for square conversion: {bbox}")
+
+    side = min(width, height)
+    square_x1 = x1 + (width - side) // 2
+    square_y1 = y1 + (height - side) // 2
+    square_x2 = square_x1 + side
+    square_y2 = square_y1 + side
+    return (square_x1, square_y1, square_x2, square_y2)
 
 
 class SegmentViewer(tk.Tk):
@@ -111,15 +222,19 @@ class SegmentViewer(tk.Tk):
         self.overlay_cache: dict[int, dict[int | None, Image.Image]] = {}
         self.entry_assets_cache: dict[int, dict[str, Any]] = {}
         self.current_hovered_region: int | None = None
+        self.selected_region_index: int | None = None
+        self.selected_crop_bbox: tuple[int, int, int, int] | None = None
         self.rendered_bounds: tuple[int, int, int, int] | None = None
         self.current_photo: ImageTk.PhotoImage | None = None
-        self.match_result_cache: dict[tuple[int, int], dict[str, Any]] = {}
+        self.match_result_cache: dict[tuple[int, int, str], dict[str, Any]] = {}
         self.searching = False
         self.spinner_index = 0
         self.spinner_chars = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
         self.search_thread: threading.Thread | None = None
         self.ground_truth_map = self._load_ground_truth_map()
         self.product_catalog = self._load_product_catalog()
+        self.goto_index_var = tk.StringVar()
+        self.search_method_var = tk.StringVar(value="hsi_dinov2")
 
         self._build_ui()
         self.bind("<Left>", lambda _event: self.show_previous())
@@ -137,8 +252,30 @@ class SegmentViewer(tk.Tk):
         self.prev_button = tk.Button(top, text="← Previous", command=self.show_previous, width=12)
         self.prev_button.pack(side="left")
 
+        self.goto_entry = tk.Entry(top, textvariable=self.goto_index_var, width=6, justify="center")
+        self.goto_entry.pack(side="left", padx=(8, 0))
+        self.goto_entry.bind("<Return>", self.on_go_to_index)
+
+        self.goto_button = tk.Button(top, text="Go", command=self.go_to_index, width=5)
+        self.goto_button.pack(side="left", padx=(6, 0))
+
         self.next_button = tk.Button(top, text="Next →", command=self.show_next, width=12)
         self.next_button.pack(side="left", padx=(8, 0))
+
+        tk.Label(top, text="Method:").pack(side="left", padx=(10, 4))
+        self.method_menu = tk.OptionMenu(
+            top,
+            self.search_method_var,
+            "dinov2",
+            "dinov3",
+            "gram",
+            "hsi",
+            "hsi_dinov2",
+            "perspective",
+            "dinov2_texture_faiss",
+        )
+        self.method_menu.config(width=8)
+        self.method_menu.pack(side="left")
 
         self.counter_label = tk.Label(top, text="")
         self.counter_label.pack(side="left", padx=16)
@@ -195,7 +332,22 @@ class SegmentViewer(tk.Tk):
         if not GROUND_TRUTH_PATH.exists():
             return {}
         payload = load_json(GROUND_TRUTH_PATH)
-        return payload if isinstance(payload, dict) else {}
+        if isinstance(payload, dict):
+            return {str(filename): str(product_id) for filename, product_id in payload.items()}
+        if not isinstance(payload, list):
+            return {}
+
+        catalog: dict[str, str] = {}
+        for record in payload:
+            if not isinstance(record, dict):
+                continue
+            product_id = record.get("id")
+            if product_id is None:
+                continue
+            image_name = record.get("image_name") or record.get("imageName")
+            if isinstance(image_name, str) and image_name.strip():
+                catalog[image_name.strip()] = str(product_id)
+        return catalog
 
     def _load_product_catalog(self) -> dict[str, dict[str, Any]]:
         if not PRODUCT_EXPORT_PATH.exists():
@@ -205,8 +357,12 @@ class SegmentViewer(tk.Tk):
             return {}
         catalog: dict[str, dict[str, Any]] = {}
         for record in payload:
-            if isinstance(record, dict) and record.get("id") is not None:
-                catalog[str(record["id"])] = record
+            if not isinstance(record, dict):
+                continue
+            product_id = record.get("id")
+            if product_id is None:
+                continue
+            catalog[str(product_id)] = record
         return catalog
 
     def _resolve_current_ground_truth_product(self) -> dict[str, Any] | None:
@@ -219,10 +375,6 @@ class SegmentViewer(tk.Tk):
                 image_rel,
                 str(Path(image_rel).as_posix()),
             ])
-        candidates.extend([
-            str(Path(image_rel).name),
-            str(Path(image_rel).as_posix()),
-        ])
         seen = set()
         for candidate in candidates:
             if candidate and candidate not in seen:
@@ -230,6 +382,33 @@ class SegmentViewer(tk.Tk):
                 product_id = self.ground_truth_map.get(candidate)
                 if product_id:
                     return self.product_catalog.get(str(product_id))
+
+        alt_candidates = []
+        if image_rel:
+            file_name = Path(image_rel).name
+            alt_candidates.extend([
+                file_name,
+                file_name.replace(".png", ""),
+                file_name.replace(".jpg", ""),
+                file_name.replace(".jpeg", ""),
+                file_name.replace(".webp", ""),
+            ])
+        for candidate in alt_candidates:
+            if candidate and candidate not in seen:
+                seen.add(candidate)
+                product_id = self.ground_truth_map.get(candidate)
+                if product_id:
+                    return self.product_catalog.get(str(product_id))
+
+        fallback_keys = list(self.product_catalog.keys())
+        for key in fallback_keys:
+            record = self.product_catalog.get(key)
+            if not isinstance(record, dict):
+                continue
+            image_name_value = record.get("image_name") or record.get("imageName")
+            if image_name_value and Path(image_rel).name == str(image_name_value):
+                return record
+
         return None
 
     def show_previous(self):
@@ -249,6 +428,9 @@ class SegmentViewer(tk.Tk):
         if not isinstance(regions, list):
             regions = []
 
+        self.selected_region_index = None
+        self.selected_crop_bbox = None
+        self.goto_index_var.set(str(self.current_index + 1))
         self.counter_label.config(text=f"Image {self.current_index + 1}/{len(self.entries)}")
         self.info_label.config(
             text=f"{image_rel}\nRegions: {len(regions)}",
@@ -259,6 +441,25 @@ class SegmentViewer(tk.Tk):
         self.clear_match_results()
         self.render_current()
 
+    def on_go_to_index(self, _event: tk.Event) -> None:
+        self.go_to_index()
+
+    def go_to_index(self) -> None:
+        raw = self.goto_index_var.get().strip()
+        if not raw:
+            return
+        if not raw.isdigit():
+            self.results_status.config(text=f"Invalid page '{raw}'. Enter a number between 1 and {len(self.entries)}.")
+            return
+
+        target = int(raw)
+        if target < 1 or target > len(self.entries):
+            self.results_status.config(text=f"Page out of range. Enter a number between 1 and {len(self.entries)}.")
+            return
+
+        self.current_index = target - 1
+        self.show_current()
+
     def render_real_match(self) -> None:
         for child in self.real_match_body.winfo_children():
             child.destroy()
@@ -268,18 +469,17 @@ class SegmentViewer(tk.Tk):
             tk.Label(self.real_match_body, text="No ground-truth match found for this image.", justify="left", anchor="w", wraplength=280).pack(fill="x")
             return
 
-        product_name = product.get("productName") or "Unknown product"
-        brand_name = product.get("brandName") or "Unknown brand"
-        product_url = None
-        brand_slug = product.get("brandSlug")
-        product_slug = product.get("productSlug")
-        if brand_slug and product_slug:
-            product_url = f"https://lightbeans.com/en/texture/{brand_slug}/{product_slug}"
+        product_name = product.get("productName") or product.get("name") or "Unknown product"
+        brand_name = product.get("brandName") or product.get("brand_name") or "Unknown brand"
+        product_url = resolve_product_url(product)
 
         texture_url = None
-        preview_path = product.get("previewPath")
+        preview_path = product.get("previewPath") or product.get("image_url") or product.get("imageUrl")
         if preview_path:
-            texture_url = build_texture_url(str(preview_path)) if preview_path else None
+            if isinstance(preview_path, str) and (preview_path.startswith("http://") or preview_path.startswith("https://")):
+                texture_url = preview_path
+            else:
+                texture_url = build_texture_url(str(preview_path))
 
         row = tk.Frame(self.real_match_body)
         row.pack(fill="x")
@@ -300,22 +500,26 @@ class SegmentViewer(tk.Tk):
 
         title = tk.Label(content, text=f"{brand_name} — {product_name}", justify="left", anchor="w", wraplength=200, font=("TkDefaultFont", 10, "bold"))
         title.pack(fill="x")
+        if product_url:
+            title.bind("<Button-1>", lambda _event, url=product_url: webbrowser.open(url))
+            title.config(fg="blue", cursor="hand2")
 
         details = []
         if product.get("productCategory"):
             details.append(f"Category: {', '.join(str(v) for v in product.get('productCategory', []))}")
+        if product.get("product_category"):
+            details.append(f"Category: {as_display_list(product.get('product_category'))}")
         if product.get("materialType"):
             details.append(f"Material: {', '.join(str(v) for v in product.get('materialType', []))}")
+        if product.get("material_type"):
+            details.append(f"Material: {as_display_list(product.get('material_type'))}")
         if product.get("color"):
             details.append(f"Color: {', '.join(str(v) for v in product.get('color', []))}")
-        if product_url:
-            details.append(f"Link: {product_url}")
+        if product.get("image_name"):
+            details.append(f"Image: {product.get('image_name')}")
         if details:
             info = tk.Label(content, text="\n".join(details), justify="left", anchor="w", wraplength=220, font=("TkDefaultFont", 9))
             info.pack(fill="x", pady=(4, 0))
-            if product_url:
-                info.bind("<Button-1>", lambda _event, url=product_url: webbrowser.open(url))
-                info.config(fg="blue", cursor="hand2")
 
     def _load_entry_assets(self, entry_index: int) -> dict[str, Any]:
         cached = self.entry_assets_cache.get(entry_index)
@@ -369,6 +573,21 @@ class SegmentViewer(tk.Tk):
         index_cache[hovered_index] = composed
         return composed
 
+    def _selected_region_bbox(self) -> tuple[int, int, int, int] | None:
+        if self.selected_crop_bbox is not None:
+            return self.selected_crop_bbox
+        if self.selected_region_index is None:
+            return None
+        assets = self._load_entry_assets(self.current_index)
+        region_masks = assets["region_masks"]
+        if self.selected_region_index < 0 or self.selected_region_index >= len(region_masks):
+            return None
+        mask = region_masks[self.selected_region_index]
+        try:
+            return square_subset_from_bbox(extract_max_fitting_bbox(mask))
+        except ValueError:
+            return None
+
     def render_current(self):
         try:
             image = self._compose_current(self.current_hovered_region)
@@ -381,6 +600,18 @@ class SegmentViewer(tk.Tk):
         available_h = max(200, self.image_container.winfo_height() - 16)
         display = image.copy()
         display.thumbnail((available_w, available_h), Image.Resampling.LANCZOS)
+        bbox = self._selected_region_bbox()
+        if bbox is not None:
+            x1, y1, x2, y2 = bbox
+            scale_x = display.width / max(1, image.width)
+            scale_y = display.height / max(1, image.height)
+            dx1 = max(0, min(display.width - 1, int(round(x1 * scale_x))))
+            dy1 = max(0, min(display.height - 1, int(round(y1 * scale_y))))
+            dx2 = max(dx1, min(display.width - 1, int(round(x2 * scale_x)) - 1))
+            dy2 = max(dy1, min(display.height - 1, int(round(y2 * scale_y)) - 1))
+            drawer = ImageDraw.Draw(display)
+            drawer.rectangle([(dx1, dy1), (dx2, dy2)], outline=(255, 255, 255), width=3)
+            drawer.rectangle([(dx1, dy1), (dx2, dy2)], outline=(255, 69, 58), width=2)
         rendered_w, rendered_h = display.size
         offset_x = max(0, (self.image_container.winfo_width() - rendered_w) // 2)
         offset_y = max(0, (self.image_container.winfo_height() - rendered_h) // 2)
@@ -456,11 +687,35 @@ class SegmentViewer(tk.Tk):
         self.results_status.config(text=f"Top {len(matches)} matches for selected region", justify="left", wraplength=300)
         self.results_status.pack(anchor="w", padx=8, pady=(8, 6))
 
+        real_product = self._resolve_current_ground_truth_product()
+        real_texture_key = None
+        if isinstance(real_product, dict):
+            real_texture_key = texture_url_key(resolve_product_url(real_product))
+
         for idx, match in enumerate(matches, start=1):
-            match_frame = tk.Frame(self.search_results_frame, bd=1, relief="solid", padx=6, pady=6)
+            product_url = resolve_product_url(match)
+            match_texture_key = texture_url_key(product_url)
+            is_real_match = bool(real_texture_key and match_texture_key and real_texture_key == match_texture_key)
+
+            border_width = 5 if is_real_match else 1
+            border_color = "#22c55e" if is_real_match else "#808080"
+            match_frame = tk.Frame(
+                self.search_results_frame,
+                bd=border_width,
+                relief="solid",
+                padx=6,
+                pady=6,
+                highlightthickness=border_width,
+                highlightbackground=border_color,
+                highlightcolor=border_color,
+            )
             match_frame.pack(fill="x", padx=8, pady=6)
 
-            title = match.get("product_name") or match.get("brand_name") or match.get("product_id") or f"Match {idx}"
+            product_name = match.get("name") or match.get("product_name") or match.get("brand_name") or match.get("product_id") or f"Match {idx}"
+            image_url = match.get("image_url") or match.get("texture_url") or match.get("preview_path")
+            if image_url and not (isinstance(image_url, str) and (image_url.startswith("http://") or image_url.startswith("https://"))):
+                image_url = build_texture_url(str(image_url))
+
             score = match.get("score")
             if score is not None:
                 try:
@@ -470,41 +725,51 @@ class SegmentViewer(tk.Tk):
                     score_label = f"score={score}"
             else:
                 score_label = "score=n/a"
-            tk.Label(match_frame, text=f"#{idx} {title} ({score_label})", justify="left", anchor="w", wraplength=260, font=("TkDefaultFont", 10, "bold")).pack(fill="x")
 
             inner = tk.Frame(match_frame)
             inner.pack(fill="x", pady=(4, 0))
 
-            texture_url = match.get("texture_url")
-            if texture_url:
-                preview = self.download_thumbnail(texture_url, (72, 72))
+            left = tk.Frame(inner)
+            left.pack(side="left", padx=(0, 8), pady=2)
+            if image_url:
+                preview = self.download_thumbnail(image_url, (72, 72))
                 if preview is not None:
                     rgba = preview.convert("RGBA")
                     white_bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
                     composited = Image.alpha_composite(white_bg, rgba)
                     photo = ImageTk.PhotoImage(composited)
-                    label = tk.Label(inner, image=photo)
-                    label.image = photo
-                    label.pack(side="left", padx=(0, 8), pady=2)
+                    image_label = tk.Label(left, image=photo, bd=0)
+                    image_label.image = photo
+                    image_label.pack()
+                    if product_url:
+                        image_label.bind("<Button-1>", lambda _event, url=product_url: webbrowser.open(url))
+                        image_label.config(cursor="hand2")
 
-            feature_lines = []
-            for key in ["brand_name", "product_category", "material_type", "location", "application", "color"]:
-                value = match.get(key)
-                if value:
-                    value_text = value if isinstance(value, str) else ", ".join(str(item) for item in value)
-                    feature_lines.append(f"{key}: {value_text}")
-
-            product_url = match.get("product_url")
-            if product_url:
-                feature_lines.append(f"product: {product_url}")
-
-            preview_text = "\n".join(feature_lines[:6]) if feature_lines else "No feature metadata"
-            details = tk.Label(inner, text=preview_text, justify="left", anchor="w", wraplength=220, font=("TkDefaultFont", 9))
-            details.pack(side="left", fill="both", expand=True)
+            right = tk.Frame(inner)
+            right.pack(side="left", fill="both", expand=True)
 
             if product_url:
-                details.bind("<Button-1>", lambda _event, url=product_url: webbrowser.open(url))
-                details.config(fg="blue", cursor="hand2")
+                name_label = tk.Label(
+                    right,
+                    text=f"#{idx} {product_name} ({score_label})",
+                    justify="left",
+                    anchor="w",
+                    wraplength=220,
+                    font=("TkDefaultFont", 10, "bold"),
+                    fg="blue",
+                    cursor="hand2",
+                )
+                name_label.pack(fill="x")
+                name_label.bind("<Button-1>", lambda _event, url=product_url: webbrowser.open(url))
+            else:
+                tk.Label(
+                    right,
+                    text=f"#{idx} {product_name} ({score_label})",
+                    justify="left",
+                    anchor="w",
+                    wraplength=220,
+                    font=("TkDefaultFont", 10, "bold"),
+                ).pack(fill="x")
 
     def on_mouse_move(self, event: tk.Event):
         hovered = self._region_at_display_position(event.x, event.y)
@@ -520,6 +785,8 @@ class SegmentViewer(tk.Tk):
     def on_click(self, _event: tk.Event):
         if self.current_hovered_region is None:
             return
+        self.selected_region_index = self.current_hovered_region
+        self.render_current()
         self.match_selected_region(self.current_hovered_region)
 
     def match_selected_region(self, region_index: int) -> None:
@@ -538,15 +805,34 @@ class SegmentViewer(tk.Tk):
             self.results_status.config(text="Selected region is out of range.")
             return
 
-        cache_key = (self.current_index, region_index)
+        try:
+            max_bbox = extract_max_fitting_bbox(region_masks[region_index])
+            selected_bbox = square_subset_from_bbox(max_bbox)
+        except ValueError:
+            self.results_status.config(text="Selected region is empty.")
+            return
+        self.selected_crop_bbox = selected_bbox
+        self.render_current()
+
+        selected_method = self.search_method_var.get().strip().lower()
+        if selected_method not in METHOD_INDEX_MAP:
+            self.results_status.config(text=f"Unknown method '{selected_method}'.")
+            return
+        selected_index = METHOD_INDEX_MAP[selected_method]
+
+        cache_key = (self.current_index, region_index, selected_method)
         if cache_key in self.match_result_cache:
-            self.display_match_results(self.match_result_cache[cache_key])
+            cached_payload = self.match_result_cache[cache_key]
+            self._apply_bbox_from_payload(cached_payload)
+            self.render_current()
+            self.display_match_results(cached_payload)
             return
 
         self.searching = True
         self.spinner_index = 0
         self.clear_match_results()
-        self.results_status.config(text="Searching for matches ⠋")
+        method_label = METHOD_LABELS.get(selected_method, selected_method)
+        self.results_status.config(text=f"Searching for matches ({method_label}) ⠋")
         self.results_status.pack(anchor="w", padx=8, pady=(8, 6))
         self._start_search_spinner()
 
@@ -559,7 +845,7 @@ class SegmentViewer(tk.Tk):
         result_path = temp_dir / f"{stem}_region_{region_index}_matches.json"
         mask_image.save(mask_path)
 
-        script_path = PROJECT_ROOT / "scripts" / "match_masked_region_to_texture.py"
+        script_path = PROJECT_ROOT / "scripts" / "segmentation" / "masked_region_texture_matcher.py"
         cmd = [
             sys.executable,
             str(script_path),
@@ -567,11 +853,43 @@ class SegmentViewer(tk.Tk):
             str(image_path),
             "--mask",
             str(mask_path),
+            "--bbox-x1",
+            str(selected_bbox[0]),
+            "--bbox-y1",
+            str(selected_bbox[1]),
+            "--bbox-x2",
+            str(selected_bbox[2]),
+            "--bbox-y2",
+            str(selected_bbox[3]),
+            "--method",
+            selected_method,
+            "--margin",
+            "0",
+            "--index",
+            selected_index,
             "--limit",
             "10",
             "--output",
             str(result_path),
         ]
+        if selected_method in METHOD_HSI_PREFILTER_INDEX_MAP:
+            cmd.extend(
+                [
+                    "--hsi-prefilter-index",
+                    METHOD_HSI_PREFILTER_INDEX_MAP[selected_method],
+                    "--hsi-prefilter-limit",
+                    "100",
+                ]
+            )
+        if selected_method == "dinov2_texture_faiss":
+            cmd.extend(
+                [
+                    "--faiss-index-root",
+                    str(PROJECT_ROOT / "texture" / "indexes" / "dinov2_faiss"),
+                    "--faiss-embedding-mode",
+                    "texture_stats",
+                ]
+            )
 
         def worker() -> None:
             try:
@@ -615,7 +933,27 @@ class SegmentViewer(tk.Tk):
             self.results_status.pack(anchor="w", padx=8, pady=(8, 6))
             return
 
+        self._apply_bbox_from_payload(payload)
+        self.render_current()
         self.display_match_results(payload)
+
+    def _apply_bbox_from_payload(self, payload: dict[str, Any]) -> None:
+        bbox = payload.get("bbox") if isinstance(payload, dict) else None
+        if not isinstance(bbox, dict):
+            self.selected_crop_bbox = None
+            return
+        try:
+            x1 = int(bbox.get("x1"))
+            y1 = int(bbox.get("y1"))
+            x2 = int(bbox.get("x2"))
+            y2 = int(bbox.get("y2"))
+        except (TypeError, ValueError):
+            self.selected_crop_bbox = None
+            return
+        if x2 <= x1 or y2 <= y1:
+            self.selected_crop_bbox = None
+            return
+        self.selected_crop_bbox = (x1, y1, x2, y2)
 
 
 def parse_args() -> argparse.Namespace:
@@ -629,13 +967,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--alpha",
         type=int,
-        default=150,
+        default=0,
         help="Overlay alpha (1-255).",
     )
     parser.add_argument(
         "--hover-alpha",
         type=int,
-        default=235,
+        default=125,
         help="Overlay alpha (1-255) for hovered region.",
     )
     return parser.parse_args()

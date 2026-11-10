@@ -25,4 +25,6 @@ evaluation_results_sample.json
 *.docx
 images/
 texture/
+textureOld/
 results/
+.venv-deepten310/

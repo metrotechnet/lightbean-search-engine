@@ -2,9 +2,9 @@
 """Convert product JSON exports into Meilisearch-friendly documents.
 
 Usage:
-  python convert_to_meilisearch.py input.json --output meilisearch-products.json
-  python convert_to_meilisearch.py platform-products-production-v2-en.json
-  python convert_to_meilisearch.py platform-products-production-v2-en.json platform-products-production-v2-fr.json --output meilisearch-products.json
+  python scripts/classification/meilisearch_products_converter.py input.json --output meilisearch-products.json
+  python scripts/classification/meilisearch_products_converter.py platform-products-production-v2-en.json
+  python scripts/classification/meilisearch_products_converter.py platform-products-production-v2-en.json platform-products-production-v2-fr.json --output meilisearch-products.json
 """
 
 from __future__ import annotations

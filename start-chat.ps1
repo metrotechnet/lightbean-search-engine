@@ -22,7 +22,7 @@ Get-Content $envPath | ForEach-Object {
     }
 }
 
-& python (Join-Path $scriptDir 'scripts\chat_meilisearch_questions.py')
+& python (Join-Path $scriptDir 'scripts\viewer\meilisearch_questions_chat.py')
 
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE

@@ -89,7 +89,7 @@ def run_searches(host: str, api_key: str | None, index_name: str, questions: lis
 
 def main() -> int:
     script_dir = Path(__file__).resolve().parent
-    project_root = script_dir.parent
+    project_root = script_dir.parent.parent
     env_path = project_root / ".env"
     env_values = load_env(env_path)
 

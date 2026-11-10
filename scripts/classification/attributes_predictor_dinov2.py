@@ -20,11 +20,11 @@ from sentence_transformers import SentenceTransformer
 from transformers import AutoImageProcessor, AutoModel
 
 
-DEFAULT_EXPORT = "data/platform-products-production-v2-en.json"
-DEFAULT_GROUND_TRUTH = "ground_truth.json"
+DEFAULT_EXPORT = "texture/lightbeans_main_page_textures.json"
+DEFAULT_GROUND_TRUTH = "texture/lightbeans_main_page_textures.json"
 DEFAULT_ATTRIBUTE_LABELS = "attribute_labels.json"
-DEFAULT_IMAGES_DIR = "images"
-DEFAULT_OUTPUT = "DINOv2_image_predictions.json"
+DEFAULT_IMAGES_DIR = "texture/main_page"
+DEFAULT_OUTPUT = "results/DINOv2_image_predictions.json"
 MODEL_NAME = "facebook/dinov2-base"
 TEXT_MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"
 
@@ -45,19 +45,43 @@ def build_attribute_catalog(records: list[dict[str, Any]]) -> dict[str, list[str
         "productCategory": [],
         "materialType": [],
         "color": [],
+        "name": [],
+        "link": [],
     }
 
     for record in records:
-        for field in catalog:
-            values = record.get(field, [])
+        if not isinstance(record, dict):
+            continue
+
+        legacy_fields = [
+            ("location", record.get("location")),
+            ("application", record.get("application")),
+            ("productCategory", record.get("productCategory")),
+            ("materialType", record.get("materialType")),
+            ("color", record.get("color")),
+        ]
+        for field_name, values in legacy_fields:
+            if values is None:
+                continue
             if isinstance(values, str):
                 values = [values]
             if not isinstance(values, list):
                 continue
             for value in values:
                 text = normalize_value(value)
-                if text and text not in catalog[field]:
-                    catalog[field].append(text)
+                if text and text not in catalog[field_name]:
+                    catalog[field_name].append(text)
+
+        fallback_fields = [
+            ("name", record.get("name")),
+            ("link", record.get("link")),
+        ]
+        for field_name, value in fallback_fields:
+            if value is None:
+                continue
+            text = normalize_value(value)
+            if text and text not in catalog[field_name]:
+                catalog[field_name].append(text)
 
     for field, values in catalog.items():
         catalog[field] = sorted(values)
@@ -70,7 +94,7 @@ def load_attribute_catalog(attribute_labels_path: Path, product_export_path: Pat
         if not isinstance(labels, dict):
             raise ValueError(f"Expected a dictionary in {attribute_labels_path}")
         catalog: dict[str, list[str]] = {}
-        for field in ["location", "application", "productCategory", "materialType", "color"]:
+        for field in ["location", "application", "productCategory", "materialType", "color", "name", "link"]:
             values = labels.get(field, [])
             if isinstance(values, list):
                 catalog[field] = [str(value).strip() for value in values if str(value).strip()]
@@ -171,9 +195,22 @@ def main() -> int:
 
     catalog = load_attribute_catalog(args.attribute_labels, args.product_export)
 
-    ground_truth = load_json(args.ground_truth)
-    if not isinstance(ground_truth, dict):
-        raise ValueError(f"Expected a dictionary in {args.ground_truth}")
+    ground_truth_raw = load_json(args.ground_truth)
+    if isinstance(ground_truth_raw, dict):
+        ground_truth = ground_truth_raw
+    elif isinstance(ground_truth_raw, list):
+        ground_truth = {}
+        for idx, record in enumerate(ground_truth_raw, start=1):
+            if not isinstance(record, dict):
+                continue
+            image_name = record.get("image_name") or record.get("imageName")
+            if isinstance(image_name, str) and image_name.strip():
+                ground_truth[image_name.strip()] = idx
+            image_url = record.get("image_url") or record.get("imageUrl")
+            if isinstance(image_url, str) and image_url.strip():
+                ground_truth[Path(image_url.strip()).name] = idx
+    else:
+        raise ValueError(f"Expected a dictionary or list in {args.ground_truth}")
 
     images_dir = args.images_dir
     if not images_dir.exists():
@@ -199,13 +236,18 @@ def main() -> int:
 
     for image_path in files:
         product_id = None
-        for filename, pid in ground_truth.items():
-            if filename == image_path.name:
-                product_id = str(pid)
-                break
+        matched_key = ground_truth.get(image_path.name)
+        if matched_key is not None:
+            product_id = str(matched_key)
+        else:
+            for filename, pid in ground_truth.items():
+                if filename == image_path.name:
+                    product_id = str(pid)
+                    break
 
         image_result: dict[str, Any] = {
             "product_id": product_id,
+            "image_name": image_path.name,
             "predicted": predict_attributes_for_image(image_path, image_model, image_processor, text_model, catalog, device),
         }
         predictions[image_path.name] = image_result
