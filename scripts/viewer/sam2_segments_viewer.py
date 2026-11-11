@@ -28,7 +28,7 @@ METHOD_INDEX_MAP = {
     "dinov3": "lightbeans-texture2-dinov3-patches",
     "gram": "lightbeans-texture2-texture-analysis",
     "hsi": "lightbeans-texture2-hsi",
-    "hsi_dinov2": "lightbeans-texture2-dinov2",
+    "hsi_dinov2": "lightbeans-texture2-dinov2-views",
     "perspective": "lightbeans-texture2-dinov2-gradient-perspective",
     "dinov2_texture_faiss": "lightbeans-texture2-dinov2",
 }
@@ -845,7 +845,7 @@ class SegmentViewer(tk.Tk):
         result_path = temp_dir / f"{stem}_region_{region_index}_matches.json"
         mask_image.save(mask_path)
 
-        script_path = PROJECT_ROOT / "scripts" / "segmentation" / "masked_region_texture_matcher.py"
+        script_path = PROJECT_ROOT / "scripts" / "viewer" / "masked_region_texture_matcher.py"
         cmd = [
             sys.executable,
             str(script_path),

@@ -110,9 +110,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--i-bins", type=int, default=16, help="Intensity histogram bins for --method hsi.")
     parser.add_argument("--hsi-prefilter-index", default="lightbeans-texture2-hsi", help="HSI prefilter index for --method hsi_dinov2.")
     parser.add_argument("--hsi-prefilter-limit", type=int, default=100, help="Number of HSI candidates kept for --method hsi_dinov2.")
-    parser.add_argument("--hsi-dinov2-scales", default="0.5,1.0,1.5,2.0", help="Comma-separated query scales for --method hsi_dinov2.")
-    parser.add_argument("--hsi-dinov2-rotations", default="0,45,90,135,180", help="Comma-separated query rotations for --method hsi_dinov2.")
-    parser.add_argument("--hsi-dinov2-size", type=int, default=224, help="Output size for scaled/rotated queries in --method hsi_dinov2.")
+    parser.add_argument("--hsi-dinov2-size", type=int, default=224, help="Output size for resized query crop in --method hsi_dinov2.")
     parser.add_argument("--perspective-model-name", default=MODEL_NAME_DINOV2, help="Embedding model name for --method perspective.")
     parser.add_argument("--yaw-angles", default="-30,0,30", help="Comma-separated yaw angles for --method perspective.")
     parser.add_argument("--pitch-angles", default="-30,0,30", help="Comma-separated pitch angles for --method perspective.")
@@ -377,98 +375,30 @@ def compute_hsi_embedding(image: Image.Image, h_bins: int, s_bins: int, i_bins: 
     return [float(v) for v in feature.tolist()]
 
 
-def compute_scaled_rotated_dino_queries(
+def compute_resized_dino_query(
     image: Image.Image,
-    scales: list[float],
-    rotations: list[float],
     output_size: int,
     model: AutoModel,
     processor: AutoImageProcessor,
     device: str,
-) -> list[dict[str, Any]]:
+) -> dict[str, Any]:
     if output_size <= 0:
         raise ValueError(f"output_size must be > 0, got {output_size}.")
-    if not scales:
-        raise ValueError("At least one scale is required for hsi_dinov2 query transforms.")
-    if not rotations:
-        raise ValueError("At least one rotation is required for hsi_dinov2 query transforms.")
-    if any(scale <= 0 for scale in scales):
-        raise ValueError(f"All scales must be > 0, got {scales}.")
 
-    resample = Image.Resampling.BICUBIC
-    base = image.convert("RGB")
-    results: list[dict[str, Any]] = []
+    resized = image.convert("RGB").resize((output_size, output_size), resample=Image.Resampling.BICUBIC)
     try:
-        base_width, base_height = base.size
-        for scale in scales:
-            scaled_width = max(1, int(round(base_width * float(scale))))
-            scaled_height = max(1, int(round(base_height * float(scale))))
-            scaled = base.resize((scaled_width, scaled_height), resample=resample)
-            try:
-                mask = Image.new("L", scaled.size, 255)
-                try:
-                    for rotation in rotations:
-                        rotated = scaled.rotate(float(rotation), resample=resample, expand=True, fillcolor=(0, 0, 0))
-                        rotated_mask = mask.rotate(float(rotation), resample=Image.Resampling.NEAREST, expand=True, fillcolor=0)
-                        try:
-                            valid = np.asarray(rotated_mask, dtype=np.uint8) > 0
-                            try:
-                                x1, y1, x2, y2 = extract_max_fitting_bbox(valid)
-                            except ValueError:
-                                x1, y1, x2, y2 = 0, 0, rotated.width, rotated.height
-
-                            side = min(x2 - x1, y2 - y1)
-                            if side <= 0:
-                                continue
-                            cx = x1 + (x2 - x1) // 2
-                            cy = y1 + (y2 - y1) // 2
-                            half = side // 2
-                            crop_x1 = max(0, cx - half)
-                            crop_y1 = max(0, cy - half)
-                            crop_x2 = crop_x1 + side
-                            crop_y2 = crop_y1 + side
-                            if crop_x2 > rotated.width:
-                                crop_x2 = rotated.width
-                                crop_x1 = max(0, crop_x2 - side)
-                            if crop_y2 > rotated.height:
-                                crop_y2 = rotated.height
-                                crop_y1 = max(0, crop_y2 - side)
-
-                            transformed = rotated.crop((crop_x1, crop_y1, crop_x2, crop_y2))
-                            try:
-                                transformed_resized = transformed.resize((output_size, output_size), resample=resample)
-                                try:
-                                    emb_list = compute_dino_embedding(
-                                        transformed_resized,
-                                        model,
-                                        processor,
-                                        device,
-                                        method="dinov2",
-                                        patch_pooling="mean",
-                                    )
-                                finally:
-                                    transformed_resized.close()
-                            finally:
-                                transformed.close()
-                            query_vec = l2_normalize(np.asarray(emb_list, dtype=np.float32).reshape(1, -1))[0]
-                            results.append(
-                                {
-                                    "scale": float(scale),
-                                    "rotation": float(rotation),
-                                    "embedding": emb_list,
-                                    "vector": query_vec,
-                                }
-                            )
-                        finally:
-                            rotated.close()
-                            rotated_mask.close()
-                finally:
-                    mask.close()
-            finally:
-                scaled.close()
+        emb_list = compute_dino_embedding(
+            resized,
+            model,
+            processor,
+            device,
+            method="dinov2",
+            patch_pooling="mean",
+        )
     finally:
-        base.close()
-    return results
+        resized.close()
+    query_vec = l2_normalize(np.asarray(emb_list, dtype=np.float32).reshape(1, -1))[0]
+    return {"embedding": emb_list, "vector": query_vec}
 
 
 def parse_angle_list(value: str) -> list[float]:
@@ -774,8 +704,10 @@ def format_hybrid_match(hit: dict[str, Any], rank: int) -> dict[str, Any]:
     formatted["hsi_score"] = hit.get("hsi_score")
     formatted["dinov2_score"] = hit.get("dinov2_score")
     formatted["combined_score"] = hit.get("combined_score")
-    formatted["dinov2_best_scale"] = hit.get("dinov2_best_scale")
-    formatted["dinov2_best_rotation"] = hit.get("dinov2_best_rotation")
+    raw_embedding = hit.get("embedding")
+    if isinstance(raw_embedding, list):
+        formatted["embedding"] = [float(value) for value in raw_embedding]
+        formatted["embedding_dim"] = len(formatted["embedding"])
     return formatted
 
 
@@ -981,28 +913,15 @@ def main() -> int:
                 model = AutoModel.from_pretrained(MODEL_NAME_DINOV2, token=hf_token)
                 model.to(device)
                 model.eval()
-                query_scales = parse_angle_list(args.hsi_dinov2_scales)
-                query_rotations = parse_angle_list(args.hsi_dinov2_rotations)
-                query_variants = compute_scaled_rotated_dino_queries(
+                query_data = compute_resized_dino_query(
                     image=cropped_image,
-                    scales=query_scales,
-                    rotations=query_rotations,
                     output_size=args.hsi_dinov2_size,
                     model=model,
                     processor=image_processor,
                     device=device,
                 )
-                if not query_variants:
-                    raise RuntimeError("No transformed DINOv2 query embeddings were generated for hsi_dinov2.")
-                baseline_query = next(
-                    (
-                        variant
-                        for variant in query_variants
-                        if abs(float(variant["scale"]) - 1.0) < 1e-6 and abs(float(variant["rotation"])) < 1e-6
-                    ),
-                    query_variants[0],
-                )
-                embedding = baseline_query["embedding"]
+                embedding = query_data["embedding"]
+                query_vec = query_data["vector"]
                 hsi_scores = build_best_hsi_score_map(hsi_hits, args.hsi_prefilter_limit)
                 candidate_docs = search_documents_by_product_ids(
                     host=args.host,
@@ -1027,19 +946,7 @@ def main() -> int:
                     if doc_vec.size != len(embedding):
                         continue
                     doc_vec = l2_normalize(doc_vec.reshape(1, -1))[0]
-                    best_dino_score = float("-inf")
-                    best_scale = None
-                    best_rotation = None
-                    for variant in query_variants:
-                        query_vec = variant["vector"]
-                        dino_score = float(np.dot(query_vec, doc_vec))
-                        if dino_score > best_dino_score:
-                            best_dino_score = dino_score
-                            best_scale = float(variant["scale"])
-                            best_rotation = float(variant["rotation"])
-                    if best_dino_score == float("-inf"):
-                        continue
-                    dino_score = best_dino_score
+                    dino_score = float(np.dot(query_vec, doc_vec))
                     if dino_score < 0.0:
                         dino_score = 0.0
                     hsi_score = float(hsi_scores[product_id])
@@ -1048,8 +955,6 @@ def main() -> int:
                     reranked = dict(doc)
                     reranked["hsi_score"] = hsi_score
                     reranked["dinov2_score"] = dino_score
-                    reranked["dinov2_best_scale"] = best_scale
-                    reranked["dinov2_best_rotation"] = best_rotation
                     reranked["combined_score"] = combined_score
                     reranked["score"] = combined_score
                     reranked["rankingScore"] = combined_score

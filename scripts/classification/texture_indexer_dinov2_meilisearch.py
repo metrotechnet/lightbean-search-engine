@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Index texture-image embeddings from DINOv2 into Meilisearch.
 
-This script loads products from the Lightbeans export, resolves each product's downloaded texture file,
-computes a DINOv2 image embedding, and uploads the product metadata + embedding to Meilisearch.
-The resulting index can then be queried by text or by nearest-neighbor similarity using the stored vector.
+This script loads products from the Lightbeans export, scans a texture-image directory (for example `texture/views`),
+matches each image to a product using the source image stem, computes a DINOv2 embedding, and uploads metadata + vector.
+The resulting index can be queried by text or nearest-neighbor similarity using the stored vector.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from transformers import AutoImageProcessor, AutoModel
 
 MODEL_NAME = "facebook/dinov2-small"
 DEFAULT_PRODUCT_EXPORT = "texture/lightbeans_main_page_textures.json"
-DEFAULT_TEXTURE_DIR = "texture/main_page"
+DEFAULT_TEXTURE_DIR = "texture/views"
 MEILI_INDEX = "lightbeans-texture2-dinov2"
 DEFAULT_INDEX = MEILI_INDEX
 
@@ -75,6 +75,13 @@ def normalize_preview_path(value: Any) -> str | None:
     if preview_path.endswith("/01.png"):
         preview_path = preview_path[: -len("/01.png")] + "/plane-1800.webp"
     return preview_path or None
+
+
+def normalize_stem(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return Path(text).stem.lower()
 
 
 def load_json(path: Path) -> Any:
@@ -140,6 +147,52 @@ def resolve_texture_path(product: dict[str, Any], texture_dir: Path, mapping_pat
     return None
 
 
+def collect_texture_images(texture_dir: Path) -> list[Path]:
+    allowed_ext = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+    images: list[Path] = []
+    for path in sorted(texture_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in allowed_ext:
+            continue
+        if path.stem.lower() == "contact_sheet":
+            continue
+        images.append(path)
+    return images
+
+
+def infer_source_stem_for_view(image_path: Path) -> str:
+    name = image_path.name
+    lower_name = name.lower()
+    if lower_name.startswith("original_"):
+        return normalize_stem(name[len("original_") :])
+
+    parent = image_path.parent
+    originals = sorted(parent.glob("original_*"))
+    for original in originals:
+        if original.is_file():
+            return normalize_stem(original.name[len("original_") :])
+
+    return normalize_stem(name)
+
+
+def build_product_lookup(products: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    lookup: dict[str, dict[str, Any]] = {}
+    for product in products:
+        image_name = product.get("image_name")
+        if isinstance(image_name, str) and image_name.strip():
+            lookup.setdefault(normalize_stem(image_name), product)
+        image_url = product.get("image_url")
+        if isinstance(image_url, str) and image_url.strip():
+            filename = image_url.rstrip("/").split("/")[-1]
+            if filename:
+                lookup.setdefault(normalize_stem(filename), product)
+        preview_path = normalize_preview_path(product.get("previewPath"))
+        if preview_path:
+            lookup.setdefault(normalize_stem(preview_path), product)
+    return lookup
+
+
 def wait_for_task(host: str, api_key: str | None, task_uid: int, timeout_seconds: int = 600, poll_seconds: float = 0.5) -> None:
     start = time.time()
     endpoint = f"{host.rstrip('/')}/tasks/{task_uid}"
@@ -163,15 +216,24 @@ def extract_task_uid(response: dict[str, Any], operation_name: str) -> int:
     return task_uid
 
 
-def ensure_index(host: str, api_key: str | None, index_name: str, primary_key: str = "product_id", vector_dimensions: int | None = None) -> None:
+def ensure_index(host: str, api_key: str | None, index_name: str, primary_key: str = "id", vector_dimensions: int | None = None) -> None:
     endpoint = f"{host.rstrip('/')}/indexes"
     payload = {"uid": index_name, "primaryKey": primary_key}
     try:
         response = http_json("POST", endpoint, payload, api_key)
         wait_for_task(host, api_key, extract_task_uid(response, "create-index"))
     except RuntimeError as exc:
-        if "already exists" not in str(exc).lower() and "index_already_exists" not in str(exc).lower():
+        message = str(exc).lower()
+        if "already exists" not in message and "index_already_exists" not in message:
             raise
+        existing = http_json("GET", f"{host.rstrip('/')}/indexes/{index_name}", api_key=api_key)
+        existing_primary_key = existing.get("primaryKey") if isinstance(existing, dict) else None
+        if existing_primary_key and existing_primary_key != primary_key:
+            raise RuntimeError(
+                f"Index '{index_name}' already exists with primary key '{existing_primary_key}', "
+                f"but this script requires primary key '{primary_key}' to index multiple views per product. "
+                f"Use a different --index or recreate the index."
+            ) from exc
 
     settings = {
         "searchableAttributes": [
@@ -179,15 +241,18 @@ def ensure_index(host: str, api_key: str | None, index_name: str, primary_key: s
             "link",
             "image_url",
             "image_name",
+            "source_image_name",
         ],
         "filterableAttributes": [
+            "id",
             "product_id",
             "name",
             "link",
             "image_url",
             "image_name",
+            "source_image_name",
         ],
-        "sortableAttributes": ["product_id"],
+        "sortableAttributes": ["product_id", "id"],
         "rankingRules": [
             "words",
             "typo",
@@ -266,17 +331,20 @@ def build_product_url(brand_slug: str | None, product_slug: str | None) -> str |
 def build_document(product: dict[str, Any], image_path: Path, embedding: list[float]) -> dict[str, Any]:
     raw_product_id = product.get("id") or product.get("image_name") or product.get("link") or image_path.stem
     product_id = sanitize_meilisearch_id(raw_product_id)
+    source_image_name = product.get("image_name") or image_path.name
+    view_id = sanitize_meilisearch_id(f"{product_id}__{image_path.parent.name}__{image_path.name}")
     product_name = product.get("name")
     product_url = product.get("link")
     image_url = product.get("image_url") or ""
-    image_name = product.get("image_name") or image_path.name
+    image_name = image_path.name
     doc = {
         "product_id": product_id,
-        "id": product_id,
+        "id": view_id,
         "name": product_name,
         "link": product_url,
         "image_url": image_url,
         "image_name": image_name,
+        "source_image_name": source_image_name,
         "image_path": image_path.as_posix(),
         "features": build_features(product),
         "embedding": embedding,
@@ -403,13 +471,14 @@ def parse_args() -> argparse.Namespace:
     env_values = load_env(project_root / ".env")
     parser = argparse.ArgumentParser(description="Index DINOv2 texture embeddings into Meilisearch.")
     parser.add_argument("--product-export", type=Path, default=Path(DEFAULT_PRODUCT_EXPORT), help="Product export JSON file.")
-    parser.add_argument("--textures-dir", type=Path, default=Path(DEFAULT_TEXTURE_DIR), help="Directory containing downloaded texture files.")
+    parser.add_argument("--textures-dir", type=Path, default=Path(DEFAULT_TEXTURE_DIR), help="Directory containing texture images to index (e.g. generated views).")
     parser.add_argument("--mapping-json", type=Path, default=None, help="Optional file-to-product mapping JSON for legacy texture exports.")
     parser.add_argument("--host", default=env_values.get("MEILI_HOST") or os.getenv("MEILI_HOST") or "http://localhost:7700", help="Meilisearch host.")
     parser.add_argument("--key", default=env_values.get("MEILI_KEY") or os.getenv("MEILI_KEY"), help="Meilisearch API key.")
     parser.add_argument("--index", default=env_values.get("MEILI_INDEX") or os.getenv("MEILI_INDEX") or MEILI_INDEX, help="Target Meilisearch index name.")
     parser.add_argument("--limit", type=int, default=0, help="Process only the first N products (0 = all).")
     parser.add_argument("--batch-size", type=int, default=8, help="Image batch size for DINOv2 inference.")
+    parser.add_argument("--upload-batch-size", type=int, default=256, help="Number of documents uploaded per Meilisearch request.")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"], help="Device for DINOv2 inference.")
     parser.add_argument("--query-image", type=Path, help="Optional image path used to run a vector search after indexing.")
     parser.add_argument("--search-limit", type=int, default=10, help="Number of hits to return from the optional vector search.")
@@ -449,29 +518,62 @@ def main() -> int:
     products = load_product_export(product_export)
     if args.limit > 0:
         products = products[: args.limit]
+    product_lookup = build_product_lookup(products)
 
-    documents: list[dict[str, Any]] = []
-    skipped = 0
-    for record in products:
+    if args.upload_batch_size <= 0:
+        raise ValueError(f"--upload-batch-size must be > 0, got {args.upload_batch_size}.")
+
+    upload_buffer: list[dict[str, Any]] = []
+    skipped_without_mapping = 0
+    indexed_files = 0
+    texture_images = collect_texture_images(args.textures_dir)
+    if not texture_images:
+        raise RuntimeError(f"No supported images found in {args.textures_dir} (excluding contact_sheet files).")
+
+    vector_dimensions: int | None = None
+    index_initialized = False
+
+    for texture_path in texture_images:
+        source_stem = infer_source_stem_for_view(texture_path)
+        record = product_lookup.get(source_stem)
+        if record is None:
+            skipped_without_mapping += 1
+            continue
+
         product_id = record.get("id") or record.get("image_name") or record.get("link") or record.get("image_url")
         if product_id is None:
+            skipped_without_mapping += 1
             continue
         if "id" not in record and product_id is not None:
             record["id"] = sanitize_meilisearch_id(product_id)
 
-        texture_path = resolve_texture_path(record, args.textures_dir, args.mapping_json)
-        if texture_path is None or not texture_path.exists():
-            skipped += 1
-            continue
-
         embedding = compute_embedding(texture_path, image_model, image_processor, device)
-        documents.append(build_document(record, texture_path, embedding))
+        doc = build_document(record, texture_path, embedding)
+        if vector_dimensions is None:
+            vector_dimensions = len(embedding)
+        if not index_initialized:
+            ensure_index(args.host, args.key, args.index, vector_dimensions=vector_dimensions)
+            index_initialized = True
 
-    vector_dimensions = len(documents[0]["embedding"]) if documents else None
-    ensure_index(args.host, args.key, args.index, vector_dimensions=vector_dimensions)
-    upload_documents(args.host, args.key, args.index, documents)
-    print(f"Indexed {len(documents)} product texture embeddings in Meilisearch index '{args.index}'.")
-    print(f"Skipped {skipped} products without a usable texture file.")
+        upload_buffer.append(doc)
+        indexed_files += 1
+        if len(upload_buffer) >= args.upload_batch_size:
+            upload_documents(args.host, args.key, args.index, upload_buffer)
+            upload_buffer.clear()
+            print(f"Uploaded {indexed_files} / {len(texture_images)} view embeddings...")
+
+    if indexed_files == 0:
+        raise RuntimeError(
+            f"No indexable view images matched product export records. "
+            f"Checked {len(texture_images)} files in {args.textures_dir}."
+        )
+
+    if upload_buffer:
+        upload_documents(args.host, args.key, args.index, upload_buffer)
+        upload_buffer.clear()
+
+    print(f"Indexed {indexed_files} texture view embeddings in Meilisearch index '{args.index}'.")
+    print(f"Skipped {skipped_without_mapping} view files without a product mapping.")
 
     if args.query_image:
         if not args.query_image.exists():
