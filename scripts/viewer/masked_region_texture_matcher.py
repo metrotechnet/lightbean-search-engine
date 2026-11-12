@@ -31,6 +31,7 @@ from transformers import AutoImageProcessor, AutoModel
 MODEL_NAME_DINOV2 = "facebook/dinov2-small"
 MODEL_NAME_DINOV3 = "facebook/dinov3-vitb16-pretrain-lvd1689m"
 DEFAULT_INDEX = "lightbeans-texture-dinov2"
+DEFAULT_HSI_DINOV2_INDEX = "lightbeans-texture-dinov2-views"
 TEXTURE_CDN = "https://cdn.lightbeans.com/textures/"
 PRODUCT_URL_BASE = "https://lightbeans.com/en/texture/"
 
@@ -109,6 +110,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--s-bins", type=int, default=16, help="Saturation histogram bins for --method hsi.")
     parser.add_argument("--i-bins", type=int, default=16, help="Intensity histogram bins for --method hsi.")
     parser.add_argument("--hsi-prefilter-index", default="lightbeans-texture2-hsi", help="HSI prefilter index for --method hsi_dinov2.")
+    parser.add_argument(
+        "--hsi-dinov2-index",
+        default=DEFAULT_HSI_DINOV2_INDEX,
+        help="DINOv2 candidate index used by --method hsi_dinov2.",
+    )
     parser.add_argument("--hsi-prefilter-limit", type=int, default=100, help="Number of HSI candidates kept for --method hsi_dinov2.")
     parser.add_argument("--hsi-dinov2-size", type=int, default=224, help="Output size for resized query crop in --method hsi_dinov2.")
     parser.add_argument("--perspective-model-name", default=MODEL_NAME_DINOV2, help="Embedding model name for --method perspective.")
@@ -662,6 +668,17 @@ def build_best_hsi_score_map(hits: list[dict[str, Any]], limit: int) -> dict[str
     return scores
 
 
+def normalize_product_key(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    normalized = "".join(ch if ch.isalnum() else "_" for ch in text)
+    normalized = normalized.strip("_")
+    while "__" in normalized:
+        normalized = normalized.replace("__", "_")
+    return normalized
+
+
 def search_documents_by_product_ids(
     host: str,
     api_key: str | None,
@@ -682,12 +699,16 @@ def search_documents_by_product_ids(
             "link",
             "image_url",
             "image_name",
+            "image_names",
             "image_path",
+            "image_paths",
+            "folder_name",
             "preview_path",
             "product_url",
             "brand_slug",
             "product_slug",
             "embedding",
+            "embedding_vectors",
         ],
         "showRankingScore": True,
     }
@@ -704,6 +725,8 @@ def format_hybrid_match(hit: dict[str, Any], rank: int) -> dict[str, Any]:
     formatted["hsi_score"] = hit.get("hsi_score")
     formatted["dinov2_score"] = hit.get("dinov2_score")
     formatted["combined_score"] = hit.get("combined_score")
+    formatted["best_embedding_index"] = hit.get("best_embedding_index")
+    formatted["best_embedding_image_name"] = hit.get("best_embedding_image_name")
     raw_embedding = hit.get("embedding")
     if isinstance(raw_embedding, list):
         formatted["embedding"] = [float(value) for value in raw_embedding]
@@ -923,10 +946,18 @@ def main() -> int:
                 embedding = query_data["embedding"]
                 query_vec = query_data["vector"]
                 hsi_scores = build_best_hsi_score_map(hsi_hits, args.hsi_prefilter_limit)
+                normalized_hsi_scores: dict[str, float] = {}
+                for product_id, score in hsi_scores.items():
+                    normalized_key = normalize_product_key(product_id)
+                    if not normalized_key:
+                        continue
+                    existing = normalized_hsi_scores.get(normalized_key)
+                    if existing is None or score > existing:
+                        normalized_hsi_scores[normalized_key] = score
                 candidate_docs = search_documents_by_product_ids(
                     host=args.host,
                     api_key=args.key,
-                    index_name=args.index,
+                    index_name=args.hsi_dinov2_index,
                     product_ids=candidate_product_ids,
                     limit=max(args.hsi_prefilter_limit, len(candidate_product_ids)),
                 )
@@ -936,28 +967,62 @@ def main() -> int:
                     if raw_product_id is None:
                         continue
                     product_id = str(raw_product_id)
-                    if product_id not in hsi_scores:
+                    hsi_score = hsi_scores.get(product_id)
+                    if hsi_score is None:
+                        hsi_score = normalized_hsi_scores.get(normalize_product_key(product_id))
+                    if hsi_score is None:
                         continue
 
-                    raw_doc_embedding = doc.get("embedding")
-                    if not isinstance(raw_doc_embedding, list) or not raw_doc_embedding:
+                    candidate_vectors: list[tuple[int | None, list[Any]]] = []
+                    raw_embedding_vectors = doc.get("embedding_vectors")
+                    if isinstance(raw_embedding_vectors, list) and raw_embedding_vectors:
+                        if all(isinstance(value, (int, float)) for value in raw_embedding_vectors):
+                            candidate_vectors.append((0, raw_embedding_vectors))
+                        else:
+                            for vector_index, candidate_vector in enumerate(raw_embedding_vectors):
+                                if isinstance(candidate_vector, list) and candidate_vector:
+                                    candidate_vectors.append((vector_index, candidate_vector))
+                    if not candidate_vectors:
+                        raw_doc_embedding = doc.get("embedding")
+                        if isinstance(raw_doc_embedding, list) and raw_doc_embedding:
+                            candidate_vectors.append((None, raw_doc_embedding))
+                    if not candidate_vectors:
                         continue
-                    doc_vec = np.asarray(raw_doc_embedding, dtype=np.float32).reshape(-1)
-                    if doc_vec.size != len(embedding):
+
+                    best_dino_score_for_doc: float | None = None
+                    best_vector_index_for_doc: int | None = None
+                    for vector_index, candidate_vector in candidate_vectors:
+                        doc_vec = np.asarray(candidate_vector, dtype=np.float32).reshape(-1)
+                        if doc_vec.size != len(embedding):
+                            continue
+                        doc_vec = l2_normalize(doc_vec.reshape(1, -1))[0]
+                        score = float(np.dot(query_vec, doc_vec))
+                        if best_dino_score_for_doc is None or score > best_dino_score_for_doc:
+                            best_dino_score_for_doc = score
+                            best_vector_index_for_doc = vector_index
+
+                    if best_dino_score_for_doc is None:
                         continue
-                    doc_vec = l2_normalize(doc_vec.reshape(1, -1))[0]
-                    dino_score = float(np.dot(query_vec, doc_vec))
+                    dino_score = best_dino_score_for_doc
                     if dino_score < 0.0:
                         dino_score = 0.0
-                    hsi_score = float(hsi_scores[product_id])
-                    combined_score = hsi_score * dino_score
+                    hsi_score_value = float(hsi_score)
+                    combined_score = hsi_score_value * dino_score
 
                     reranked = dict(doc)
-                    reranked["hsi_score"] = hsi_score
+                    reranked["hsi_score"] = hsi_score_value
                     reranked["dinov2_score"] = dino_score
                     reranked["combined_score"] = combined_score
                     reranked["score"] = combined_score
                     reranked["rankingScore"] = combined_score
+                    reranked["best_embedding_index"] = best_vector_index_for_doc
+                    image_names = doc.get("image_names")
+                    if (
+                        isinstance(image_names, list)
+                        and best_vector_index_for_doc is not None
+                        and 0 <= best_vector_index_for_doc < len(image_names)
+                    ):
+                        reranked["best_embedding_image_name"] = image_names[best_vector_index_for_doc]
 
                     existing = best_by_product_id.get(product_id)
                     if existing is None or float(existing["combined_score"]) < combined_score:
@@ -965,8 +1030,9 @@ def main() -> int:
 
                 if candidate_docs and not best_by_product_id:
                     raise RuntimeError(
-                        "HSI prefilter returned candidates, but no candidate had a usable DINOv2 embedding "
-                        f"in index '{args.index}'."
+                        "HSI prefilter returned candidates, but none could be reranked with a compatible DINOv2 embedding. "
+                        f"Checked {len(candidate_docs)} candidate documents in index '{args.hsi_dinov2_index}'. "
+                        "Verify product_id alignment and embedding vector dimensions."
                     )
 
                 hits = sorted(
@@ -1063,11 +1129,8 @@ def main() -> int:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
-        output_json = json.dumps(summary, ensure_ascii=False, indent=2) + "\n"
-        try:
-            sys.stdout.write(output_json)
-        except UnicodeEncodeError:
-            sys.stdout.buffer.write(output_json.encode("utf-8", errors="backslashreplace"))
+        output_json = json.dumps(summary, ensure_ascii=True, indent=2) + "\n"
+        sys.stdout.write(output_json)
         return 0
     finally:
         image.close()

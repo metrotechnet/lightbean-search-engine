@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import math
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -347,6 +348,30 @@ def collect_input_images(input_path: Path) -> list[Path]:
     raise FileNotFoundError(f"Input path not found: {input_path}")
 
 
+def generate_single_view(
+    image_bgr: np.ndarray,
+    scale: float,
+    rotation: float,
+    output_size: int,
+    direction: str,
+    perspective_strength: float,
+) -> dict[str, Any]:
+    transformed_bgr = transformed_square_view(
+        image_bgr=image_bgr,
+        scale=float(scale),
+        rotation=float(rotation),
+        output_size=output_size,
+        perspective_direction=direction,
+        perspective_strength=float(perspective_strength),
+    )
+    return {
+        "scale": float(scale),
+        "rotation": float(rotation),
+        "direction": direction,
+        "image_bgr": transformed_bgr,
+    }
+
+
 def compute_scaled_rotated_views(
     image_bgr: np.ndarray,
     scales: list[float],
@@ -367,26 +392,31 @@ def compute_scaled_rotated_views(
     if perspective_directions is None:
         perspective_directions = list(DEFAULT_PERSPECTIVE_DIRECTION)
 
-    output: list[dict[str, Any]] = []
+    tasks: list[tuple[float, float, str]] = []
     for scale in scales:
         for rotation in rotations:
             for direction in perspective_directions:
-                transformed_bgr = transformed_square_view(
-                    image_bgr=image_bgr,
-                    scale=float(scale),
-                    rotation=float(rotation),
-                    output_size=output_size,
-                    perspective_direction=direction,
-                    perspective_strength=float(perspective_strength),
-                )
-                output.append(
-                    {
-                        "scale": float(scale),
-                        "rotation": float(rotation),
-                        "direction": direction,
-                        "image_bgr": transformed_bgr,
-                    }
-                )
+                tasks.append((float(scale), float(rotation), direction))
+
+    output: list[dict[str, Any]] = []
+    if not tasks:
+        return output
+
+    with ThreadPoolExecutor(max_workers=max(1, len(tasks))) as executor:
+        futures = [
+            executor.submit(
+                generate_single_view,
+                image_bgr=image_bgr,
+                scale=scale,
+                rotation=rotation,
+                output_size=output_size,
+                direction=direction,
+                perspective_strength=float(perspective_strength),
+            )
+            for scale, rotation, direction in tasks
+        ]
+        for future in futures:
+            output.append(future.result())
     return output
 
 
@@ -406,8 +436,8 @@ def generate_for_image(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     original_square = cv2.resize(image_bgr, (size, size), interpolation=cv2.INTER_AREA)
-    original_path = output_dir / f"original_{image_path.stem}.jpg"
-    cv2.imwrite(str(original_path), original_square, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+    # original_path = output_dir / f"original_{image_path.stem}.jpg"
+    # cv2.imwrite(str(original_path), original_square, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
 
     contact_cells: list[tuple[str, np.ndarray]] = [("original", original_square)]
     generated = 0
@@ -471,7 +501,7 @@ def main() -> int:
         if input_path.is_dir():
             rel = image_path.relative_to(input_path).as_posix()
             rel_dir = safe_dir_component(rel.rsplit(".", 1)[0].replace("/", "__"))
-            image_output_dir = output_root / f"{idx:05d}_{rel_dir}"
+            image_output_dir = output_root / f"{rel_dir}"
         else:
             image_output_dir = output_root
 

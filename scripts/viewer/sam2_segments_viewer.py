@@ -893,13 +893,15 @@ class SegmentViewer(tk.Tk):
 
         def worker() -> None:
             try:
-                completed = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                completed = subprocess.run(cmd, capture_output=True, text=False, timeout=300)
             except subprocess.TimeoutExpired:
                 self.after(0, lambda: self._finish_match_search(None, "Matching timed out for this region."))
                 return
 
             if completed.returncode != 0:
-                error_text = completed.stderr.strip() or completed.stdout.strip() or "Unknown matching error."
+                stderr_text = completed.stderr.decode("utf-8", errors="replace").strip() if completed.stderr else ""
+                stdout_text = completed.stdout.decode("utf-8", errors="replace").strip() if completed.stdout else ""
+                error_text = stderr_text or stdout_text or "Unknown matching error."
                 self.after(0, lambda: self._finish_match_search(None, f"Matching failed:\n{error_text}"))
                 return
 

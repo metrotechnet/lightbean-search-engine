@@ -9,6 +9,7 @@ The resulting index can be queried by text or nearest-neighbor similarity using 
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import time
@@ -24,8 +25,9 @@ from transformers import AutoImageProcessor, AutoModel
 MODEL_NAME = "facebook/dinov2-small"
 DEFAULT_PRODUCT_EXPORT = "texture/lightbeans_main_page_textures.json"
 DEFAULT_TEXTURE_DIR = "texture/views"
-MEILI_INDEX = "lightbeans-texture2-dinov2"
+MEILI_INDEX = "lightbeans-texture-dinov2-views"
 DEFAULT_INDEX = MEILI_INDEX
+DEFAULT_MAX_UPLOAD_PAYLOAD_MIB = 90
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -45,7 +47,7 @@ def http_json(method: str, url: str, payload: dict | list | None = None, api_key
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    data = None if payload is None else json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     req = request.Request(url, data=data, headers=headers, method=method)
     try:
         with request.urlopen(req, timeout=120) as resp:
@@ -161,19 +163,12 @@ def collect_texture_images(texture_dir: Path) -> list[Path]:
     return images
 
 
-def infer_source_stem_for_view(image_path: Path) -> str:
-    name = image_path.name
-    lower_name = name.lower()
-    if lower_name.startswith("original_"):
-        return normalize_stem(name[len("original_") :])
-
-    parent = image_path.parent
-    originals = sorted(parent.glob("original_*"))
-    for original in originals:
-        if original.is_file():
-            return normalize_stem(original.name[len("original_") :])
-
-    return normalize_stem(name)
+def collect_view_folders(texture_dir: Path) -> list[tuple[Path, list[Path]]]:
+    folder_to_images: dict[Path, list[Path]] = {}
+    for image_path in collect_texture_images(texture_dir):
+        folder_to_images.setdefault(image_path.parent, []).append(image_path)
+    folders = sorted(folder_to_images.keys())
+    return [(folder, sorted(folder_to_images[folder])) for folder in folders]
 
 
 def build_product_lookup(products: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -216,24 +211,27 @@ def extract_task_uid(response: dict[str, Any], operation_name: str) -> int:
     return task_uid
 
 
-def ensure_index(host: str, api_key: str | None, index_name: str, primary_key: str = "id", vector_dimensions: int | None = None) -> None:
-    endpoint = f"{host.rstrip('/')}/indexes"
-    payload = {"uid": index_name, "primaryKey": primary_key}
+def delete_index_if_exists(host: str, api_key: str | None, index_name: str) -> None:
+    index_endpoint = f"{host.rstrip('/')}/indexes/{index_name}"
     try:
-        response = http_json("POST", endpoint, payload, api_key)
-        wait_for_task(host, api_key, extract_task_uid(response, "create-index"))
+        http_json("GET", index_endpoint, api_key=api_key)
     except RuntimeError as exc:
         message = str(exc).lower()
-        if "already exists" not in message and "index_already_exists" not in message:
-            raise
-        existing = http_json("GET", f"{host.rstrip('/')}/indexes/{index_name}", api_key=api_key)
-        existing_primary_key = existing.get("primaryKey") if isinstance(existing, dict) else None
-        if existing_primary_key and existing_primary_key != primary_key:
-            raise RuntimeError(
-                f"Index '{index_name}' already exists with primary key '{existing_primary_key}', "
-                f"but this script requires primary key '{primary_key}' to index multiple views per product. "
-                f"Use a different --index or recreate the index."
-            ) from exc
+        if "http 404" in message or "index_not_found" in message:
+            return
+        raise
+
+    response = http_json("DELETE", index_endpoint, api_key=api_key)
+    wait_for_task(host, api_key, extract_task_uid(response, "delete-index"))
+    print(f"Deleted existing index '{index_name}'.")
+
+
+def ensure_index(host: str, api_key: str | None, index_name: str, primary_key: str = "id", vector_dimensions: int | None = None) -> None:
+    delete_index_if_exists(host, api_key, index_name)
+    endpoint = f"{host.rstrip('/')}/indexes"
+    payload = {"uid": index_name, "primaryKey": primary_key}
+    response = http_json("POST", endpoint, payload, api_key)
+    wait_for_task(host, api_key, extract_task_uid(response, "create-index"))
 
     settings = {
         "searchableAttributes": [
@@ -328,29 +326,53 @@ def build_product_url(brand_slug: str | None, product_slug: str | None) -> str |
     return f"https://lightbeans.com/en/texture/{brand}/{product}"
 
 
-def build_document(product: dict[str, Any], image_path: Path, embedding: list[float]) -> dict[str, Any]:
-    raw_product_id = product.get("id") or product.get("image_name") or product.get("link") or image_path.stem
-    product_id = sanitize_meilisearch_id(raw_product_id)
-    source_image_name = product.get("image_name") or image_path.name
-    view_id = sanitize_meilisearch_id(f"{product_id}__{image_path.parent.name}__{image_path.name}")
-    product_name = product.get("name")
-    product_url = product.get("link")
-    image_url = product.get("image_url") or ""
-    image_name = image_path.name
-    doc = {
+def average_embedding(vectors: list[list[float]]) -> list[float]:
+    if not vectors:
+        raise ValueError("Cannot average an empty embedding list.")
+    matrix = np.asarray(vectors, dtype=np.float32)
+    mean_vector = matrix.mean(axis=0)
+    normalized = l2_normalize(np.asarray([mean_vector], dtype=np.float32))[0]
+    return [float(value) for value in normalized.tolist()]
+
+
+def build_folder_document(
+    folder_id: str,
+    folder_path: Path,
+    view_paths: list[Path],
+    view_embeddings: list[list[float]],
+    product: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if len(view_paths) != len(view_embeddings):
+        raise ValueError(
+            f"view_paths/view_embeddings length mismatch for {folder_path}: "
+            f"{len(view_paths)} != {len(view_embeddings)}"
+        )
+    if not view_embeddings:
+        raise ValueError(f"No embeddings generated for folder: {folder_path}")
+
+    record = product or {}
+    product_id = record.get("id") or record.get("image_name") or record.get("link") or folder_id
+    product_id = sanitize_meilisearch_id(product_id)
+    representative_embedding = average_embedding(view_embeddings)
+    source_image_name = record.get("image_name") or folder_path.name
+
+    return {
+        "id": folder_id,
+        "folder_name": folder_path.name,
+        "folder_path": folder_path.as_posix(),
         "product_id": product_id,
-        "id": view_id,
-        "name": product_name,
-        "link": product_url,
-        "image_url": image_url,
-        "image_name": image_name,
+        "name": record.get("name"),
+        "link": record.get("link"),
+        "image_url": record.get("image_url") or "",
         "source_image_name": source_image_name,
-        "image_path": image_path.as_posix(),
-        "features": build_features(product),
-        "embedding": embedding,
-        "_vectors": {"default": embedding},
+        "image_names": [path.name for path in view_paths],
+        "image_paths": [path.as_posix() for path in view_paths],
+        "view_count": len(view_paths),
+        "features": build_features(record),
+        "embedding": representative_embedding,
+        "embedding_vectors": view_embeddings,
+        "_vectors": {"default": representative_embedding},
     }
-    return doc
 
 
 def upload_documents(host: str, api_key: str | None, index_name: str, documents: list[dict[str, Any]]) -> None:
@@ -358,6 +380,53 @@ def upload_documents(host: str, api_key: str | None, index_name: str, documents:
     response = http_json("POST", endpoint, documents, api_key)
     task_uid = extract_task_uid(response, "upload-documents")
     wait_for_task(host, api_key, task_uid)
+
+
+def estimate_json_bytes(payload: Any) -> int:
+    return len(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+
+
+def upload_documents_with_payload_limit(
+    host: str,
+    api_key: str | None,
+    index_name: str,
+    documents: list[dict[str, Any]],
+    max_payload_bytes: int,
+) -> list[int]:
+    if max_payload_bytes <= 0:
+        raise ValueError(f"max_payload_bytes must be > 0, got {max_payload_bytes}.")
+    if not documents:
+        return []
+
+    chunk_sizes: list[int] = []
+    current_chunk: list[dict[str, Any]] = []
+    current_bytes = 2  # []
+
+    for doc in documents:
+        doc_bytes = estimate_json_bytes(doc)
+        min_doc_container_bytes = doc_bytes + 2
+        if min_doc_container_bytes > max_payload_bytes:
+            doc_id = doc.get("id")
+            raise RuntimeError(
+                f"Single document exceeds payload limit ({doc_bytes} bytes > {max_payload_bytes} bytes). "
+                f"Document id: {doc_id!r}. Reduce per-document payload before uploading."
+            )
+
+        add_bytes = doc_bytes + (1 if current_chunk else 0)  # comma between array items
+        if current_chunk and current_bytes + add_bytes > max_payload_bytes:
+            upload_documents(host, api_key, index_name, current_chunk)
+            chunk_sizes.append(len(current_chunk))
+            current_chunk = []
+            current_bytes = 2
+
+        current_chunk.append(doc)
+        current_bytes += doc_bytes + (1 if len(current_chunk) > 1 else 0)
+
+    if current_chunk:
+        upload_documents(host, api_key, index_name, current_chunk)
+        chunk_sizes.append(len(current_chunk))
+
+    return chunk_sizes
 
 
 def search_by_image(
@@ -483,6 +552,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query-image", type=Path, help="Optional image path used to run a vector search after indexing.")
     parser.add_argument("--search-limit", type=int, default=10, help="Number of hits to return from the optional vector search.")
     parser.add_argument("--search-output", type=Path, help="Optional output JSON path for viewer-compatible search payload.")
+    parser.add_argument(
+        "--expected-views-per-folder",
+        type=int,
+        default=48,
+        help="Expected number of view images per folder (excluding contact_sheet).",
+    )
+    parser.add_argument(
+        "--max-upload-payload-mib",
+        type=int,
+        default=DEFAULT_MAX_UPLOAD_PAYLOAD_MIB,
+        help="Maximum JSON payload size (MiB) per Meilisearch document upload request.",
+    )
     args = parser.parse_args()
     if env_values.get("HF_TOKEN"):
         os.environ["HF_TOKEN"] = env_values["HF_TOKEN"]
@@ -522,58 +603,101 @@ def main() -> int:
 
     if args.upload_batch_size <= 0:
         raise ValueError(f"--upload-batch-size must be > 0, got {args.upload_batch_size}.")
+    if args.batch_size <= 0:
+        raise ValueError(f"--batch-size must be > 0, got {args.batch_size}.")
+    if args.expected_views_per_folder <= 0:
+        raise ValueError(
+            f"--expected-views-per-folder must be > 0, got {args.expected_views_per_folder}."
+        )
+    if args.max_upload_payload_mib <= 0:
+        raise ValueError(
+            f"--max-upload-payload-mib must be > 0, got {args.max_upload_payload_mib}."
+        )
+    max_upload_payload_bytes = int(args.max_upload_payload_mib * 1024 * 1024)
 
     upload_buffer: list[dict[str, Any]] = []
-    skipped_without_mapping = 0
-    indexed_files = 0
-    texture_images = collect_texture_images(args.textures_dir)
-    if not texture_images:
+    indexed_folders = 0
+    total_indexed_views = 0
+    skipped_with_invalid_view_count = 0
+    view_folders = collect_view_folders(args.textures_dir)
+    if not view_folders:
         raise RuntimeError(f"No supported images found in {args.textures_dir} (excluding contact_sheet files).")
 
     vector_dimensions: int | None = None
     index_initialized = False
+    for folder_path, view_paths in view_folders:
+        if len(view_paths) != args.expected_views_per_folder:
+            skipped_with_invalid_view_count += 1
+            print(
+                f"Skipping folder '{folder_path.name}': expected "
+                f"{args.expected_views_per_folder} views but found {len(view_paths)}."
+            )
+            continue
 
-    for texture_path in texture_images:
-        source_stem = infer_source_stem_for_view(texture_path)
+        folder_id = sanitize_meilisearch_id(folder_path.name)
+        source_stem = normalize_stem(folder_path.name)
         record = product_lookup.get(source_stem)
-        if record is None:
-            skipped_without_mapping += 1
-            continue
+        if record is not None and "id" not in record:
+            fallback_id = record.get("image_name") or record.get("link") or record.get("image_url")
+            if fallback_id:
+                record["id"] = sanitize_meilisearch_id(fallback_id)
 
-        product_id = record.get("id") or record.get("image_name") or record.get("link") or record.get("image_url")
-        if product_id is None:
-            skipped_without_mapping += 1
-            continue
-        if "id" not in record and product_id is not None:
-            record["id"] = sanitize_meilisearch_id(product_id)
-
-        embedding = compute_embedding(texture_path, image_model, image_processor, device)
-        doc = build_document(record, texture_path, embedding)
+        with ThreadPoolExecutor(max_workers=len(view_paths)) as folder_executor:
+            view_embeddings = list(
+                folder_executor.map(
+                    lambda texture_path: compute_embedding(texture_path, image_model, image_processor, device),
+                    view_paths,
+                )
+            )
+        doc = build_folder_document(
+            folder_id=folder_id,
+            folder_path=folder_path,
+            view_paths=view_paths,
+            view_embeddings=view_embeddings,
+            product=record,
+        )
         if vector_dimensions is None:
-            vector_dimensions = len(embedding)
+            vector_dimensions = len(doc["embedding"])
         if not index_initialized:
             ensure_index(args.host, args.key, args.index, vector_dimensions=vector_dimensions)
             index_initialized = True
 
         upload_buffer.append(doc)
-        indexed_files += 1
+        indexed_folders += 1
+        total_indexed_views += len(view_paths)
         if len(upload_buffer) >= args.upload_batch_size:
-            upload_documents(args.host, args.key, args.index, upload_buffer)
+            upload_documents_with_payload_limit(
+                args.host,
+                args.key,
+                args.index,
+                upload_buffer,
+                max_payload_bytes=max_upload_payload_bytes,
+            )
             upload_buffer.clear()
-            print(f"Uploaded {indexed_files} / {len(texture_images)} view embeddings...")
+            print(f"Uploaded {indexed_folders} / {len(view_folders)} folder documents...")
 
-    if indexed_files == 0:
+    if indexed_folders == 0:
         raise RuntimeError(
-            f"No indexable view images matched product export records. "
-            f"Checked {len(texture_images)} files in {args.textures_dir}."
+            f"No indexable view folders found. "
+            f"Checked {len(view_folders)} folders in {args.textures_dir} "
+            f"with expected view count {args.expected_views_per_folder}."
         )
 
     if upload_buffer:
-        upload_documents(args.host, args.key, args.index, upload_buffer)
+        upload_documents_with_payload_limit(
+            args.host,
+            args.key,
+            args.index,
+            upload_buffer,
+            max_payload_bytes=max_upload_payload_bytes,
+        )
         upload_buffer.clear()
 
-    print(f"Indexed {indexed_files} texture view embeddings in Meilisearch index '{args.index}'.")
-    print(f"Skipped {skipped_without_mapping} view files without a product mapping.")
+    print(
+        f"Indexed {indexed_folders} texture folders ({total_indexed_views} views) "
+        f"in Meilisearch index '{args.index}'."
+    )
+    print(f"Skipped {skipped_with_invalid_view_count} folders with invalid view count.")
 
     if args.query_image:
         if not args.query_image.exists():

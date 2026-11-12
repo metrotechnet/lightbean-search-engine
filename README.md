@@ -46,8 +46,12 @@ This project evaluates product discovery and retrieval using Meilisearch and a c
   `python scripts/crawler/texture_images_downloader.py data/platform-products-production-v2-en.json --output-dir texture --mapping-output texture/texture_product_mapping.json`
 - Build a DINOv2 texture embedding index in Meilisearch with product features and vector embeddings:
   `python scripts/classification/texture_indexer_dinov2_meilisearch.py --product-export texture/lightbeans_main_page_textures.json --textures-dir texture/views --index lightbeans-texture2-dinov2-views`
-  - When indexing generated views, `contact_sheet` images are automatically skipped.
+  - Folders under `texture/views` are indexed as one document per folder, using the folder name as the document `id`.
+  - The indexer computes embeddings for all non-`contact_sheet` view images in each folder (default expected count: `48`) and stores all vectors in `embedding_vectors`.
   - Use `--upload-batch-size` (default `256`) to control upload chunk size and avoid oversized requests.
+  - Uploads are automatically split by payload size (default `--max-upload-payload-mib 90`) to stay under Meilisearch request limits.
+  - Before indexing, the script deletes any existing target index and recreates it to guarantee a clean schema/data state.
+  - Use `--expected-views-per-folder` to enforce the exact number of non-`contact_sheet` views per folder.
   - This script automatically reads `MEILI_HOST`, `MEILI_KEY`, and `MEILI_INDEX` from the project `.env` file when present.
 - Retrieve stored embeddings directly by product id or product name:
   - This helper builds/updates the DINOv2 views index first by default (use `--no-build-index` to only query).
