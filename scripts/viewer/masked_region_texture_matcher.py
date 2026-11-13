@@ -4,7 +4,7 @@
 Workflow:
 1. Load an input image and a binary mask.
 2. Find the largest axis-aligned rectangle fully contained in the mask.
-3. Crop the image to that box and compute an embedding (DINOv2, DINOv3, Gram, HSI, perspective-gradient, DINOv2 texture-stats).
+3. Crop the image to that box and run HSI prefilter + DINOv2 reranking.
 4. Search the Meilisearch texture index for the 5 most similar products.
 5. Return the matches with their scores and texture URLs.
 """
@@ -19,21 +19,26 @@ import time
 from pathlib import Path
 from typing import Any
 from urllib import error, request
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import numpy as np
 import torch
 from PIL import Image
-from torchvision import transforms
-from torchvision.models import VGG19_Weights, vgg19
 from transformers import AutoImageProcessor, AutoModel
 
 MODEL_NAME_DINOV2 = "facebook/dinov2-small"
-MODEL_NAME_DINOV3 = "facebook/dinov3-vitb16-pretrain-lvd1689m"
-DEFAULT_INDEX = "lightbeans-texture-dinov2"
-DEFAULT_HSI_DINOV2_INDEX = "lightbeans-texture-dinov2-views"
+DEFAULT_HSI_DINOV2_INDEX = "lightbeans-texture-hsi-dinov2-views"
 TEXTURE_CDN = "https://cdn.lightbeans.com/textures/"
 PRODUCT_URL_BASE = "https://lightbeans.com/en/texture/"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+SEARCH_ATTRIBUTES_TO_RETRIEVE = [
+    "id",
+    "brandName",
+    "productName",
+    "link",
+    "image_url",
+    "dinov2_embedding_vectors",
+]
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -66,6 +71,99 @@ def http_json(method: str, url: str, payload: dict | list | None = None, api_key
         raise RuntimeError(f"Could not reach Meilisearch at {url}: {exc}") from exc
 
 
+def format_payload_size(size_bytes: int) -> str:
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    if size_bytes < (1024 * 1024):
+        return f"{size_bytes / 1024.0:.1f} KiB"
+    return f"{size_bytes / (1024.0 * 1024.0):.2f} MiB"
+
+
+def log_server_metric(
+    *,
+    enabled: bool,
+    step_name: str | None,
+    method: str,
+    url: str,
+    status: int | str,
+    request_bytes: int,
+    response_bytes: int,
+    elapsed_seconds: float,
+) -> None:
+    # if not enabled:
+    #     return
+    path = urlparse(url).path or url
+    label = step_name or "request"
+    sys.stderr.write(
+        f"[meili] {label} {method} {path} status={status} "
+        f"req={format_payload_size(request_bytes)} resp={format_payload_size(response_bytes)} "
+        f"time={elapsed_seconds:.3f}s\n"
+    )
+    sys.stderr.flush()
+
+
+def http_json_with_metrics(
+    method: str,
+    url: str,
+    payload: dict | list | None = None,
+    api_key: str | None = None,
+    *,
+    log_metrics: bool = False,
+    step_name: str | None = None,
+):
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    request_bytes = len(data) if data is not None else 0
+    req = request.Request(url, data=data, headers=headers, method=method)
+    started_at = time.perf_counter()
+    try:
+        with request.urlopen(req, timeout=120) as resp:
+            body_bytes = resp.read()
+            elapsed_seconds = time.perf_counter() - started_at
+            log_server_metric(
+                enabled=log_metrics,
+                step_name=step_name,
+                method=method,
+                url=url,
+                status=getattr(resp, "status", "unknown"),
+                request_bytes=request_bytes,
+                response_bytes=len(body_bytes),
+                elapsed_seconds=elapsed_seconds,
+            )
+            body = body_bytes.decode("utf-8")
+            return json.loads(body) if body else {}
+    except error.HTTPError as exc:
+        body_bytes = exc.read()
+        elapsed_seconds = time.perf_counter() - started_at
+        log_server_metric(
+            enabled=log_metrics,
+            step_name=step_name,
+            method=method,
+            url=url,
+            status=exc.code,
+            request_bytes=request_bytes,
+            response_bytes=len(body_bytes),
+            elapsed_seconds=elapsed_seconds,
+        )
+        body = body_bytes.decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {exc.code} for {url}: {body}") from exc
+    except error.URLError as exc:
+        elapsed_seconds = time.perf_counter() - started_at
+        log_server_metric(
+            enabled=log_metrics,
+            step_name=step_name,
+            method=method,
+            url=url,
+            status="url-error",
+            request_bytes=request_bytes,
+            response_bytes=0,
+            elapsed_seconds=elapsed_seconds,
+        )
+        raise RuntimeError(f"Could not reach Meilisearch at {url}: {exc}") from exc
+
+
 def load_json(path: Path) -> Any:
     with path.open("r", encoding="utf-8") as fh:
         return json.load(fh)
@@ -82,8 +180,7 @@ def as_list(value: Any) -> list[str]:
 
 
 def parse_args() -> argparse.Namespace:
-    project_root = Path(__file__).resolve().parents[2]
-    env_values = load_env(project_root / ".env")
+    env_values = load_env(PROJECT_ROOT / ".env")
     parser = argparse.ArgumentParser(description="Crop a masked region from an image, embed it, and match it against a Meilisearch texture index.")
     parser.add_argument("--image", type=Path, required=True, help="Input image file.")
     parser.add_argument("--mask", type=Path, required=True, help="Binary mask image, same size as the input image.")
@@ -92,49 +189,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bbox-y1", type=int, help="Optional crop bbox y1 (inclusive) provided by caller.")
     parser.add_argument("--bbox-x2", type=int, help="Optional crop bbox x2 (exclusive) provided by caller.")
     parser.add_argument("--bbox-y2", type=int, help="Optional crop bbox y2 (exclusive) provided by caller.")
-    parser.add_argument("--host", default=env_values.get("MEILI_HOST") or os.getenv("MEILI_HOST") or "http://localhost:7700", help="Meilisearch host.")
+    parser.add_argument("--host", default=env_values.get("MEILI_HOST") or os.getenv("MEILI_HOST"), help="Meilisearch host.")
     parser.add_argument("--key", default=env_values.get("MEILI_KEY") or os.getenv("MEILI_KEY"), help="Meilisearch API key.")
-    parser.add_argument("--index", default=env_values.get("MEILI_INDEX") or os.getenv("MEILI_INDEX") or DEFAULT_INDEX, help="Meilisearch index to search.")
+    parser.add_argument("--index", default=env_values.get("MEILI_INDEX") or os.getenv("MEILI_INDEX") or DEFAULT_HSI_DINOV2_INDEX, help="Meilisearch candidate index to search.")
     parser.add_argument(
         "--method",
-        default="dinov2",
-        choices=["dinov2", "dinov3", "gram", "hsi", "perspective", "hsi_dinov2", "dinov2_texture_faiss"],
-        help="Embedding backend.",
+        default="hsi_dinov2",
+        choices=["hsi_dinov2"],
+        help="Embedding backend (only hsi_dinov2 is supported).",
     )
-    parser.add_argument("--dinov3-model-name", default=MODEL_NAME_DINOV3, help="DINOv3 model name for --method dinov3.")
-    parser.add_argument("--patch-pool", default="mean", choices=["mean", "max", "cls"], help="DINOv3 patch pooling mode.")
-    parser.add_argument("--lbp-points", type=int, default=8, help="LBP neighborhood points for --method gram.")
-    parser.add_argument("--lbp-radius", type=int, default=1, help="LBP radius for --method gram.")
-    parser.add_argument("--gram-layer-index", type=int, default=8, help="VGG19 feature layer index for --method gram.")
-    parser.add_argument("--h-bins", type=int, default=36, help="Hue histogram bins for --method hsi.")
-    parser.add_argument("--s-bins", type=int, default=16, help="Saturation histogram bins for --method hsi.")
-    parser.add_argument("--i-bins", type=int, default=16, help="Intensity histogram bins for --method hsi.")
-    parser.add_argument("--hsi-prefilter-index", default="lightbeans-texture2-hsi", help="HSI prefilter index for --method hsi_dinov2.")
-    parser.add_argument(
-        "--hsi-dinov2-index",
-        default=DEFAULT_HSI_DINOV2_INDEX,
-        help="DINOv2 candidate index used by --method hsi_dinov2.",
-    )
+    parser.add_argument("--h-bins", type=int, default=36, help="Hue histogram bins for HSI prefilter.")
+    parser.add_argument("--s-bins", type=int, default=16, help="Saturation histogram bins for HSI prefilter.")
+    parser.add_argument("--i-bins", type=int, default=16, help="Intensity histogram bins for HSI prefilter.")
     parser.add_argument("--hsi-prefilter-limit", type=int, default=100, help="Number of HSI candidates kept for --method hsi_dinov2.")
     parser.add_argument("--hsi-dinov2-size", type=int, default=224, help="Output size for resized query crop in --method hsi_dinov2.")
-    parser.add_argument("--perspective-model-name", default=MODEL_NAME_DINOV2, help="Embedding model name for --method perspective.")
-    parser.add_argument("--yaw-angles", default="-30,0,30", help="Comma-separated yaw angles for --method perspective.")
-    parser.add_argument("--pitch-angles", default="-30,0,30", help="Comma-separated pitch angles for --method perspective.")
-    parser.add_argument("--perspective-roll", type=float, default=0.0, help="Roll angle for --method perspective.")
-    parser.add_argument("--perspective-output-width", type=int, default=448, help="Projection output width for --method perspective.")
-    parser.add_argument("--perspective-output-height", type=int, default=448, help="Projection output height for --method perspective.")
-    parser.add_argument("--perspective-focal-length", type=float, default=650.0, help="Virtual camera focal length for --method perspective.")
-    parser.add_argument("--perspective-camera-distance", type=float, default=2.5, help="Plane distance for --method perspective.")
-    parser.add_argument("--sobel-ksize", type=int, default=3, choices=[1, 3, 5, 7], help="Sobel kernel size for --method perspective.")
-    parser.add_argument("--grad-norm-max", type=float, default=11.313708, help="Fixed gradient normalization max for --method perspective.")
-    parser.add_argument("--perspective-crop-valid-region", action=argparse.BooleanOptionalAction, default=True, help="Crop valid projected area for --method perspective.")
-    parser.add_argument("--faiss-index-root", type=Path, default=Path("texture/indexes/dinov2_faiss"), help="Local FAISS index directory for --method dinov2_texture_faiss.")
-    parser.add_argument("--faiss-embedding-mode", default="texture_stats", choices=["cls", "mean", "texture_stats"], help="Embedding mode for --method dinov2_texture_faiss.")
-    parser.add_argument("--faiss-input-size", type=int, default=224, help="Input size used by --method dinov2_texture_faiss (must match index build config).")
-    parser.add_argument("--faiss-batch-size", type=int, default=16, help="Batch size for --method dinov2_texture_faiss.")
     parser.add_argument("--limit", type=int, default=10, help="Number of matches to return.")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"], help="Device for embedding inference.")
     parser.add_argument("--output", type=Path, help="Optional JSON file to save the result.")
+    parser.add_argument("--filter-location", help="Optional selected location key/value filter from viewer.")
+    parser.add_argument("--filter-application", help="Optional selected application key/value filter from viewer.")
+    parser.add_argument("--filter-product-category", help="Optional selected product category key/value filter from viewer.")
+    parser.add_argument("--filter-material-type", help="Optional selected material type key/value filter from viewer.")
+    parser.add_argument("--filter-color", help="Optional selected color key/value filter from viewer.")
+    parser.add_argument("--filter-brand-name", help="Optional selected brand name key/value filter from viewer.")
+    parser.add_argument("--log-server-metrics", action="store_true", help="Log Meilisearch request/response sizes and latency for each HTTP call.")
     args = parser.parse_args()
     if env_values.get("HF_TOKEN"):
         os.environ["HF_TOKEN"] = env_values["HF_TOKEN"]
@@ -232,115 +310,21 @@ def l2_normalize(vector: np.ndarray) -> np.ndarray:
     return vector / norms
 
 
-def compute_lbp_histogram(gray: np.ndarray, points: int = 8, radius: int = 1) -> np.ndarray:
-    if points <= 0:
-        raise ValueError("LBP points must be > 0.")
-    if points > 16:
-        raise ValueError("LBP points > 16 creates very large histograms; choose <= 16.")
-    if radius <= 0:
-        raise ValueError("LBP radius must be > 0.")
-
-    h, w = gray.shape
-    padded = np.pad(gray, radius, mode="edge")
-    center = padded[radius : radius + h, radius : radius + w]
-    lbp = np.zeros((h, w), dtype=np.uint32)
-
-    for bit in range(points):
-        theta = 2.0 * np.pi * bit / points
-        dy = int(round(-radius * np.sin(theta)))
-        dx = int(round(radius * np.cos(theta)))
-        neighbor = padded[radius + dy : radius + dy + h, radius + dx : radius + dx + w]
-        lbp |= ((neighbor >= center).astype(np.uint32) << bit)
-
-    bins = 1 << points
-    hist = np.bincount(lbp.ravel(), minlength=bins).astype(np.float32)
-    hist_sum = float(hist.sum())
-    if hist_sum > 0:
-        hist /= hist_sum
-    return hist
-
-
-class VGGGramExtractor(torch.nn.Module):
-    def __init__(self, layer_index: int = 8):
-        super().__init__()
-        weights = VGG19_Weights.IMAGENET1K_V1
-        model = vgg19(weights=weights)
-        features = list(model.features.children())
-        if layer_index < 0 or layer_index >= len(features):
-            raise ValueError(f"layer_index must be in [0, {len(features) - 1}], got {layer_index}.")
-        self.features = torch.nn.Sequential(*features[: layer_index + 1])
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        fmap = self.features(x)
-        b, c, h, w = fmap.shape
-        fm = fmap.view(b, c, h * w)
-        gram = torch.bmm(fm, fm.transpose(1, 2)) / float(c * h * w)
-        return gram
-
-
-def gram_upper_triangle(gram: np.ndarray) -> np.ndarray:
-    c, _ = gram.shape
-    tri = np.triu_indices(c)
-    return gram[tri].astype(np.float32)
-
-
-def patch_pool(last_hidden_state: torch.Tensor, mode: str) -> torch.Tensor:
-    if last_hidden_state.ndim != 3:
-        raise RuntimeError(f"Unexpected hidden-state shape: {tuple(last_hidden_state.shape)}")
-
-    if mode == "cls":
-        return last_hidden_state[:, 0, :]
-
-    tokens = last_hidden_state[:, 1:, :] if last_hidden_state.shape[1] > 1 else last_hidden_state
-    if tokens.shape[1] == 0:
-        tokens = last_hidden_state
-
-    if mode == "mean":
-        return tokens.mean(dim=1)
-    if mode == "max":
-        return tokens.max(dim=1).values
-    raise ValueError(f"Unknown patch pooling mode '{mode}'.")
-
-
-def compute_dino_embedding(image: Image.Image, model: AutoModel, processor: AutoImageProcessor, device: str, method: str, patch_pooling: str) -> list[float]:
+def compute_dino_embedding(image: Image.Image, model: AutoModel, processor: AutoImageProcessor, device: str) -> list[float]:
     pixel_values = processor(images=image, return_tensors="pt")
     pixel_values = {key: value.to(device) for key, value in pixel_values.items()}
     with torch.no_grad():
         outputs = model(**pixel_values)
 
         if hasattr(outputs, "last_hidden_state"):
-            if method == "dinov3":
-                embedding = patch_pool(outputs.last_hidden_state, patch_pooling)
-            else:
-                embedding = outputs.last_hidden_state[:, 0, :]
+            embedding = outputs.last_hidden_state[:, 0, :]
         elif hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
             embedding = outputs.pooler_output
         else:
-            raise RuntimeError(f"{method} output does not expose a usable embedding.")
+            raise RuntimeError("DINOv2 output does not expose a usable embedding.")
 
     embedding = l2_normalize(embedding.detach().cpu().numpy().astype(np.float32))[0]
     return [float(value) for value in embedding.tolist()]
-
-
-def compute_gram_embedding(
-    image: Image.Image,
-    gram_extractor: VGGGramExtractor,
-    image_transform: transforms.Compose,
-    device: str,
-    lbp_points: int,
-    lbp_radius: int,
-) -> list[float]:
-    gray = np.asarray(image.convert("L"), dtype=np.uint8)
-    lbp_hist = compute_lbp_histogram(gray, points=lbp_points, radius=lbp_radius)
-
-    tensor = image_transform(image).unsqueeze(0).to(device)
-    with torch.no_grad():
-        gram = gram_extractor(tensor)[0].detach().cpu().numpy()
-    gram_vec = gram_upper_triangle(gram)
-
-    feature = np.concatenate([lbp_hist, gram_vec], axis=0).astype(np.float32)
-    feature = l2_normalize(feature.reshape(1, -1))[0]
-    return [float(v) for v in feature.tolist()]
 
 
 def rgb_to_hsi(image_rgb: np.ndarray) -> np.ndarray:
@@ -398,8 +382,6 @@ def compute_resized_dino_query(
             model,
             processor,
             device,
-            method="dinov2",
-            patch_pooling="mean",
         )
     finally:
         resized.close()
@@ -407,134 +389,25 @@ def compute_resized_dino_query(
     return {"embedding": emb_list, "vector": query_vec}
 
 
-def parse_angle_list(value: str) -> list[float]:
-    parts = [item.strip() for item in str(value).split(",") if item.strip()]
-    if not parts:
-        raise ValueError("Angle list cannot be empty.")
-    return [float(item) for item in parts]
-
-
-def rotation_matrix(yaw_deg: float, pitch_deg: float, roll_deg: float = 0.0) -> np.ndarray:
-    yaw = np.radians(yaw_deg)
-    pitch = np.radians(pitch_deg)
-    roll = np.radians(roll_deg)
-    ry = np.array([[np.cos(yaw), 0.0, np.sin(yaw)], [0.0, 1.0, 0.0], [-np.sin(yaw), 0.0, np.cos(yaw)]], dtype=np.float32)
-    rx = np.array([[1.0, 0.0, 0.0], [0.0, np.cos(pitch), -np.sin(pitch)], [0.0, np.sin(pitch), np.cos(pitch)]], dtype=np.float32)
-    rz = np.array([[np.cos(roll), -np.sin(roll), 0.0], [np.sin(roll), np.cos(roll), 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
-    return rz @ ry @ rx
-
-
-def compute_gradient_magnitude(gray_uint8: np.ndarray, sobel_ksize: int, grad_norm_max: float) -> np.ndarray:
-    try:
-        import cv2
-    except ModuleNotFoundError as exc:
-        raise RuntimeError("OpenCV is required for method 'perspective'. Install with: pip install opencv-python") from exc
-    gray = gray_uint8.astype(np.float32) / 255.0
-    grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=sobel_ksize)
-    grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=sobel_ksize)
-    magnitude = cv2.magnitude(grad_x, grad_y)
-    return np.clip(magnitude / float(grad_norm_max), 0.0, 1.0)
-
-
-def project_gradient(
-    gradient: np.ndarray,
-    yaw: float,
-    pitch: float,
-    roll: float,
-    output_width: int,
-    output_height: int,
-    focal_px: float,
-    distance_px: float,
-    crop_valid_region: bool,
-) -> np.ndarray:
-    try:
-        import cv2
-    except ModuleNotFoundError as exc:
-        raise RuntimeError("OpenCV is required for method 'perspective'. Install with: pip install opencv-python") from exc
-
-    in_h, in_w = gradient.shape
-    src = np.array([[0.0, 0.0], [in_w - 1.0, 0.0], [in_w - 1.0, in_h - 1.0], [0.0, in_h - 1.0]], dtype=np.float32)
-    max_dim = max(in_w, in_h)
-    if max_dim <= 0:
-        raise ValueError("Invalid input image size for projection.")
-    half_w = (in_w / max_dim) * 0.5
-    half_h = (in_h / max_dim) * 0.5
-    plane_pts = np.array(
-        [[-half_w, -half_h, 0.0], [half_w, -half_h, 0.0], [half_w, half_h, 0.0], [-half_w, half_h, 0.0]],
-        dtype=np.float32,
-    )
-    rot = rotation_matrix(yaw, pitch, roll)
-    rotated = (rot @ plane_pts.T).T
-    rotated[:, 2] += distance_px
-
-    cx = output_width / 2.0
-    cy = output_height / 2.0
-    projected = np.zeros((4, 2), dtype=np.float32)
-    for idx, pt in enumerate(rotated):
-        projected[idx, 0] = focal_px * (pt[0] / pt[2]) + cx
-        projected[idx, 1] = focal_px * (pt[1] / pt[2]) + cy
-
-    h_matrix = cv2.getPerspectiveTransform(src, projected)
-    warped = cv2.warpPerspective(
-        gradient,
-        h_matrix,
-        (output_width, output_height),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0.0,
-    )
-    valid_src = np.ones((in_h, in_w), dtype=np.uint8)
-    valid_mask = cv2.warpPerspective(
-        valid_src,
-        h_matrix,
-        (output_width, output_height),
-        flags=cv2.INTER_NEAREST,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
-    )
-    valid_binary = valid_mask > 0
-
-    if not np.any(valid_binary):
-        return cv2.resize(gradient, (output_width, output_height), interpolation=cv2.INTER_LINEAR)
-
-    if crop_valid_region:
-        try:
-            x1, y1, x2, y2 = extract_max_fitting_bbox(valid_binary)
-        except ValueError:
-            ys, xs = np.nonzero(valid_binary)
-            if xs.size == 0 or ys.size == 0:
-                return cv2.resize(gradient, (output_width, output_height), interpolation=cv2.INTER_LINEAR)
-            x1, y1 = int(xs.min()), int(ys.min())
-            x2, y2 = int(xs.max()) + 1, int(ys.max()) + 1
-        cropped = warped[y1:y2, x1:x2]
-        if cropped.size > 0:
-            warped = cv2.resize(cropped, (output_width, output_height), interpolation=cv2.INTER_LINEAR)
-    return warped
-
-
-def gradient_projection_to_embedding(
-    gradient_projection: np.ndarray,
-    model: AutoModel,
-    processor: AutoImageProcessor,
-    device: str,
-) -> list[float]:
-    projection_uint8 = np.clip(np.round(gradient_projection * 255.0), 0, 255).astype(np.uint8)
-    projection_image = Image.fromarray(projection_uint8, mode="L").convert("RGB")
-    return compute_dino_embedding(
-        image=projection_image,
-        model=model,
-        processor=processor,
-        device=device,
-        method="dinov2",
-        patch_pooling="mean",
-    )
-
-
-def wait_for_task(host: str, api_key: str | None, task_uid: int, timeout_seconds: int = 600, poll_seconds: float = 0.5) -> None:
+def wait_for_task(
+    host: str,
+    api_key: str | None,
+    task_uid: int,
+    timeout_seconds: int = 600,
+    poll_seconds: float = 0.5,
+    *,
+    log_metrics: bool = False,
+) -> None:
     start = time.time()
     endpoint = f"{host.rstrip('/')}/tasks/{task_uid}"
     while True:
-        task = http_json("GET", endpoint, api_key=api_key)
+        task = http_json_with_metrics(
+            "GET",
+            endpoint,
+            api_key=api_key,
+            log_metrics=log_metrics,
+            step_name=f"task {task_uid} poll",
+        )
         status = task.get("status")
         if status == "succeeded":
             return
@@ -553,7 +426,14 @@ def extract_task_uid(response: dict[str, Any], operation_name: str) -> int:
     return task_uid
 
 
-def configure_index_embedder(host: str, api_key: str | None, index_name: str, vector_dimensions: int) -> None:
+def configure_index_embedder(
+    host: str,
+    api_key: str | None,
+    index_name: str,
+    vector_dimensions: int,
+    *,
+    log_metrics: bool = False,
+) -> None:
     settings = {
         "embedders": {
             "default": {
@@ -562,8 +442,15 @@ def configure_index_embedder(host: str, api_key: str | None, index_name: str, ve
             }
         }
     }
-    response = http_json("PATCH", f"{host.rstrip('/')}/indexes/{index_name}/settings", settings, api_key)
-    wait_for_task(host, api_key, extract_task_uid(response, "update-settings"))
+    response = http_json_with_metrics(
+        "PATCH",
+        f"{host.rstrip('/')}/indexes/{index_name}/settings",
+        settings,
+        api_key,
+        log_metrics=log_metrics,
+        step_name="update embedder settings",
+    )
+    wait_for_task(host, api_key, extract_task_uid(response, "update-settings"), log_metrics=log_metrics)
 
 
 def search_meilisearch(
@@ -573,63 +460,85 @@ def search_meilisearch(
     vector: list[float],
     limit: int = 10,
     filter_expression: str | None = None,
+    *,
+    log_metrics: bool = False,
 ) -> dict[str, Any]:
     endpoint = f"{host.rstrip('/')}/indexes/{index_name}/search"
     payload = {
         "vector": vector,
         "limit": limit,
-        "attributesToRetrieve": [
-            "product_id",
-            "projection_id",
-            "yaw",
-            "pitch",
-            "roll",
-            "name",
-            "link",
-            "image_url",
-            "image_name",
-            "image_path",
-        ],
+        "attributesToRetrieve": SEARCH_ATTRIBUTES_TO_RETRIEVE,
         "hybrid": {"semanticRatio": 1.0, "embedder": "default"},
         "showRankingScore": True,
     }
     if filter_expression:
         payload["filter"] = filter_expression
     try:
-        return http_json("POST", endpoint, payload, api_key)
+        return http_json_with_metrics(
+            "POST",
+            endpoint,
+            payload,
+            api_key,
+            log_metrics=log_metrics,
+            step_name="vector search",
+        )
     except RuntimeError as exc:
         message = str(exc)
         if "Cannot find embedder with name `default`" not in message and "invalid_search_embedder" not in message:
             raise
-        configure_index_embedder(host, api_key, index_name, len(vector))
-        return http_json("POST", endpoint, payload, api_key)
+        configure_index_embedder(host, api_key, index_name, len(vector), log_metrics=log_metrics)
+        return http_json_with_metrics(
+            "POST",
+            endpoint,
+            payload,
+            api_key,
+            log_metrics=log_metrics,
+            step_name="vector search (retry)",
+        )
 
 
-def build_product_filter(product_ids: list[str]) -> str:
-    if not product_ids:
-        raise ValueError("Cannot build a product filter with an empty product id list.")
-    escaped: list[str] = []
-    for product_id in product_ids:
-        text = str(product_id).replace("\\", "\\\\").replace('"', '\\"')
-        escaped.append(f'"{text}"')
-    return f"product_id IN [{','.join(escaped)}]"
+def escape_filter_value(value: str) -> str:
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
 
 
-def extract_unique_product_ids(hits: list[dict[str, Any]], limit: int) -> list[str]:
-    ids: list[str] = []
-    seen: set[str] = set()
-    for hit in hits:
-        raw = hit.get("product_id") or hit.get("id")
-        if raw is None:
+def build_attribute_filter_expression_from_values(filter_values: dict[str, Any]) -> str | None:
+    raw_filters: list[tuple[list[str], Any]] = [
+        (["location"], filter_values.get("location")),
+        (["application"], filter_values.get("application")),
+        (["product_category", "productCategory"], filter_values.get("product_category")),
+        (["material_type", "materialType"], filter_values.get("material_type")),
+        (["color"], filter_values.get("color")),
+        (["brand_name", "brandName"], filter_values.get("brand_name")),
+    ]
+    clauses: list[str] = []
+    for fields, raw_value in raw_filters:
+        if raw_value is None:
             continue
-        product_id = str(raw)
-        if not product_id or product_id in seen:
+        value = str(raw_value).strip()
+        if not value:
             continue
-        ids.append(product_id)
-        seen.add(product_id)
-        if len(ids) >= limit:
-            break
-    return ids
+        escaped = escape_filter_value(value)
+        per_field = [f'{field} = "{escaped}"' for field in fields]
+        if len(per_field) == 1:
+            clauses.append(per_field[0])
+        else:
+            clauses.append("(" + " OR ".join(per_field) + ")")
+    if not clauses:
+        return None
+    return " AND ".join(clauses)
+
+
+def build_attribute_filter_expression(args: argparse.Namespace) -> str | None:
+    return build_attribute_filter_expression_from_values(
+        {
+            "location": args.filter_location,
+            "application": args.filter_application,
+            "product_category": args.filter_product_category,
+            "material_type": args.filter_material_type,
+            "color": args.filter_color,
+            "brand_name": args.filter_brand_name,
+        }
+    )
 
 
 def extract_numeric_score(hit: dict[str, Any]) -> float:
@@ -668,58 +577,6 @@ def build_best_hsi_score_map(hits: list[dict[str, Any]], limit: int) -> dict[str
     return scores
 
 
-def normalize_product_key(value: Any) -> str:
-    text = str(value or "").strip().lower()
-    if not text:
-        return ""
-    normalized = "".join(ch if ch.isalnum() else "_" for ch in text)
-    normalized = normalized.strip("_")
-    while "__" in normalized:
-        normalized = normalized.replace("__", "_")
-    return normalized
-
-
-def search_documents_by_product_ids(
-    host: str,
-    api_key: str | None,
-    index_name: str,
-    product_ids: list[str],
-    limit: int,
-) -> list[dict[str, Any]]:
-    if not product_ids:
-        return []
-    payload = {
-        "q": "",
-        "filter": build_product_filter(product_ids),
-        "limit": limit,
-        "attributesToRetrieve": [
-            "id",
-            "product_id",
-            "name",
-            "link",
-            "image_url",
-            "image_name",
-            "image_names",
-            "image_path",
-            "image_paths",
-            "folder_name",
-            "preview_path",
-            "product_url",
-            "brand_slug",
-            "product_slug",
-            "embedding",
-            "embedding_vectors",
-        ],
-        "showRankingScore": True,
-    }
-    endpoint = f"{host.rstrip('/')}/indexes/{index_name}/search"
-    response = http_json("POST", endpoint, payload, api_key)
-    if not isinstance(response, dict):
-        return []
-    raw_hits = response.get("hits", [])
-    return raw_hits if isinstance(raw_hits, list) else []
-
-
 def format_hybrid_match(hit: dict[str, Any], rank: int) -> dict[str, Any]:
     formatted = format_match(hit, rank)
     formatted["hsi_score"] = hit.get("hsi_score")
@@ -727,7 +584,9 @@ def format_hybrid_match(hit: dict[str, Any], rank: int) -> dict[str, Any]:
     formatted["combined_score"] = hit.get("combined_score")
     formatted["best_embedding_index"] = hit.get("best_embedding_index")
     formatted["best_embedding_image_name"] = hit.get("best_embedding_image_name")
-    raw_embedding = hit.get("embedding")
+    raw_embedding = hit.get("dinov2_embedding")
+    if not isinstance(raw_embedding, list):
+        raw_embedding = hit.get("embedding")
     if isinstance(raw_embedding, list):
         formatted["embedding"] = [float(value) for value in raw_embedding]
         formatted["embedding_dim"] = len(formatted["embedding"])
@@ -775,10 +634,8 @@ def format_match(hit: dict[str, Any], rank: int) -> dict[str, Any]:
     return {
         "rank": rank,
         "product_id": hit.get("product_id") or hit.get("id"),
-        "projection_id": hit.get("projection_id"),
-        "yaw": hit.get("yaw"),
-        "pitch": hit.get("pitch"),
-        "roll": hit.get("roll"),
+        "brandName": hit.get("brandName") or hit.get("brand_name"),
+        "brand_name": hit.get("brand_name") or hit.get("brandName"),
         "name": hit.get("name") or hit.get("product_name") or hit.get("productName"),
         "link": product_url,
         "image_url": image_url,
@@ -791,350 +648,312 @@ def format_match(hit: dict[str, Any], rank: int) -> dict[str, Any]:
     }
 
 
-def format_faiss_match(hit: dict[str, Any], rank: int) -> dict[str, Any]:
-    metadata = hit.get("metadata")
-    merged = metadata if isinstance(metadata, dict) else {}
-    image_value = hit.get("image") or merged.get("image")
-    image_path = str(image_value) if image_value is not None else None
-    name = merged.get("name") or merged.get("product_name") or merged.get("title")
-    if not name:
-        name = Path(image_path).stem if image_path else f"Match {rank}"
-    score = hit.get("similarity")
-    return {
-        "rank": rank,
-        "product_id": merged.get("product_id") or merged.get("id") or image_path,
-        "name": name,
-        "link": merged.get("link") or merged.get("product_url"),
-        "image_url": merged.get("image_url"),
-        "image_name": merged.get("image_name") or merged.get("filename") or (Path(image_path).name if image_path else None),
-        "product_url": merged.get("product_url") or merged.get("link"),
-        "preview_path": merged.get("preview_path"),
-        "texture_url": merged.get("image_url"),
-        "score": score,
-        "ranking_score": score,
-        "local_image": image_path,
-        "metadata": merged,
-    }
+class MaskedRegionTextureMatcher:
+    def __init__(
+        self,
+        *,
+        host: str | None = None,
+        api_key: str | None = None,
+        index_name: str = DEFAULT_HSI_DINOV2_INDEX,
+        method: str = "hsi_dinov2",
+        h_bins: int = 36,
+        s_bins: int = 16,
+        i_bins: int = 16,
+        hsi_prefilter_limit: int = 100,
+        hsi_dinov2_size: int = 224,
+        limit: int = 10,
+        device: str = "auto",
+        log_server_metrics: bool = False,
+    ):
+        env_values = load_env(PROJECT_ROOT / ".env")
+        self.host = (host or env_values.get("MEILI_HOST") or os.getenv("MEILI_HOST") or DEFAULT_MEILI_HOST).strip()
+        self.api_key = str(api_key).strip() if api_key else None
+        self.index_name = index_name
+        self.method = method
+        self.h_bins = h_bins
+        self.s_bins = s_bins
+        self.i_bins = i_bins
+        self.hsi_prefilter_limit = hsi_prefilter_limit
+        self.hsi_dinov2_size = hsi_dinov2_size
+        self.limit = limit
+        self.device = choose_device(device)
+        self.log_server_metrics = bool(log_server_metrics)
+        if self.hsi_prefilter_limit <= 0:
+            raise ValueError(f"hsi_prefilter_limit must be > 0, got {self.hsi_prefilter_limit}.")
+        if self.hsi_dinov2_size <= 0:
+            raise ValueError(f"hsi_dinov2_size must be > 0, got {self.hsi_dinov2_size}.")
+        hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+        self.image_processor = AutoImageProcessor.from_pretrained(MODEL_NAME_DINOV2, token=hf_token)
+        self.model = AutoModel.from_pretrained(MODEL_NAME_DINOV2, token=hf_token)
+        self.model.to(self.device)
+        self.model.eval()
 
+    def _build_matches(
+        self,
+        *,
+        hsi_hits: list[dict[str, Any]],
+        embedding: list[float],
+        query_vec: np.ndarray,
+    ) -> list[dict[str, Any]]:
+        hsi_scores = build_best_hsi_score_map(hsi_hits, self.hsi_prefilter_limit)
+        best_by_product_id: dict[str, dict[str, Any]] = {}
+        for doc in hsi_hits:
+            raw_product_id = doc.get("product_id") or doc.get("id")
+            if raw_product_id is None:
+                continue
+            product_id = str(raw_product_id)
+            hsi_score = hsi_scores.get(product_id)
+            if hsi_score is None:
+                continue
 
-def merge_projection_hits(projection_hits: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
-    best_by_key: dict[str, dict[str, Any]] = {}
-    for hit in projection_hits:
-        key_parts = [
-            str(hit.get("product_id") or ""),
-            str(hit.get("link") or ""),
-            str(hit.get("name") or ""),
-        ]
-        key = "|".join(key_parts)
-        existing = best_by_key.get(key)
-        current_score = hit.get("rankingScore")
-        if current_score is None:
-            current_score = hit.get("_rankingScore")
-        if existing is None:
-            best_by_key[key] = hit
-            continue
-        existing_score = existing.get("rankingScore")
-        if existing_score is None:
-            existing_score = existing.get("_rankingScore")
-        current_score_value = float(current_score) if current_score is not None else float("-inf")
-        existing_score_value = float(existing_score) if existing_score is not None else float("-inf")
-        if current_score_value > existing_score_value:
-            best_by_key[key] = hit
+            candidate_vectors: list[tuple[int | None, list[Any]]] = []
+            raw_dinov2_vectors = doc.get("dinov2_embedding_vectors")
+            if isinstance(raw_dinov2_vectors, list) and raw_dinov2_vectors:
+                if all(isinstance(value, (int, float)) for value in raw_dinov2_vectors):
+                    candidate_vectors.append((0, raw_dinov2_vectors))
+                else:
+                    for vector_index, candidate_vector in enumerate(raw_dinov2_vectors):
+                        if isinstance(candidate_vector, list) and candidate_vector:
+                            candidate_vectors.append((vector_index, candidate_vector))
 
-    sorted_hits = sorted(
-        best_by_key.values(),
-        key=lambda item: float(item.get("rankingScore") if item.get("rankingScore") is not None else item.get("_rankingScore") if item.get("_rankingScore") is not None else float("-inf")),
-        reverse=True,
-    )
-    return sorted_hits[:limit]
+            if not candidate_vectors:
+                raw_doc_embedding = doc.get("embedding")
+                if isinstance(raw_doc_embedding, list) and raw_doc_embedding:
+                    candidate_vectors.append((None, raw_doc_embedding))
+            if not candidate_vectors:
+                continue
+
+            best_dino_score_for_doc: float | None = None
+            best_vector_index_for_doc: int | None = None
+            for vector_index, candidate_vector in candidate_vectors:
+                doc_vec = np.asarray(candidate_vector, dtype=np.float32).reshape(-1)
+                if doc_vec.size != len(embedding):
+                    continue
+                doc_vec = l2_normalize(doc_vec.reshape(1, -1))[0]
+                score = float(np.dot(query_vec, doc_vec))
+                if best_dino_score_for_doc is None or score > best_dino_score_for_doc:
+                    best_dino_score_for_doc = score
+                    best_vector_index_for_doc = vector_index
+
+            if best_dino_score_for_doc is None:
+                continue
+            dino_score = max(0.0, float(best_dino_score_for_doc))
+            hsi_score_value = float(hsi_score)
+            combined_score = dino_score * hsi_score_value
+
+            reranked = dict(doc)
+            reranked["hsi_score"] = hsi_score_value
+            reranked["dinov2_score"] = dino_score
+            reranked["combined_score"] = combined_score
+            reranked["score"] = combined_score
+            reranked["rankingScore"] = combined_score
+            reranked["best_embedding_index"] = best_vector_index_for_doc
+            image_names = doc.get("image_names")
+            if (
+                isinstance(image_names, list)
+                and best_vector_index_for_doc is not None
+                and 0 <= best_vector_index_for_doc < len(image_names)
+            ):
+                reranked["best_embedding_image_name"] = image_names[best_vector_index_for_doc]
+
+            existing = best_by_product_id.get(product_id)
+            if existing is None or float(existing["combined_score"]) < combined_score:
+                best_by_product_id[product_id] = reranked
+
+        if hsi_hits and not best_by_product_id:
+            raise RuntimeError(
+                "HSI prefilter returned candidates, but none could be reranked with a compatible DINOv2 embedding. "
+                f"Checked {len(hsi_hits)} candidate documents in index '{self.index_name}'. "
+                "Verify product_id alignment and embedding vector dimensions."
+            )
+
+        hits = sorted(
+            best_by_product_id.values(),
+            key=lambda item: float(item["combined_score"]),
+            reverse=True,
+        )[: self.limit]
+        return [format_hybrid_match(hit, index) for index, hit in enumerate(hits, start=1)]
+
+    def _run_match(
+        self,
+        *,
+        image_array: np.ndarray,
+        mask_array: np.ndarray,
+        image_label: str,
+        mask_label: str,
+        margin: int,
+        provided_bbox: tuple[int, int, int, int] | None,
+        filter_values: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        run_started_at = time.perf_counter()
+        if provided_bbox is not None:
+            cropped, bbox = crop_image_from_bbox(image_array, provided_bbox)
+        else:
+            cropped, bbox = crop_image_from_mask(image_array, mask_array, margin=margin)
+
+        cropped_image = Image.fromarray(cropped.astype(np.uint8))
+        try:
+            hsi_embedding_started_at = time.perf_counter()
+            hsi_embedding = compute_hsi_embedding(
+                image=cropped_image,
+                h_bins=self.h_bins,
+                s_bins=self.s_bins,
+                i_bins=self.i_bins,
+            )
+            hsi_embedding_seconds = time.perf_counter() - hsi_embedding_started_at
+
+            attribute_filter_expression = build_attribute_filter_expression_from_values(filter_values or {})
+            hsi_search_started_at = time.perf_counter()
+            hsi_result = search_meilisearch(
+                self.host,
+                self.api_key,
+                self.index_name,
+                hsi_embedding,
+                limit=self.hsi_prefilter_limit,
+                filter_expression=attribute_filter_expression,
+                log_metrics=self.log_server_metrics,
+            )
+            hsi_search_seconds = time.perf_counter() - hsi_search_started_at
+            hsi_hits = hsi_result.get("hits", []) if isinstance(hsi_result, dict) else []
+
+            dino_query_seconds = 0.0
+            rerank_seconds = 0.0
+            if not hsi_hits:
+                embedding = hsi_embedding
+                matches: list[dict[str, Any]] = []
+            else:
+                dino_query_started_at = time.perf_counter()
+                query_data = compute_resized_dino_query(
+                    image=cropped_image,
+                    output_size=self.hsi_dinov2_size,
+                    model=self.model,
+                    processor=self.image_processor,
+                    device=self.device,
+                )
+                dino_query_seconds = time.perf_counter() - dino_query_started_at
+                embedding = query_data["embedding"]
+                rerank_started_at = time.perf_counter()
+                matches = self._build_matches(
+                    hsi_hits=hsi_hits,
+                    embedding=embedding,
+                    query_vec=query_data["vector"],
+                )
+                rerank_seconds = time.perf_counter() - rerank_started_at
+
+            return {
+                "image": image_label,
+                "mask": mask_label,
+                "bbox": bbox,
+                "method": self.method,
+                "embedding_dim": len(embedding),
+                "timing": {
+                    "hsi_embedding_seconds": hsi_embedding_seconds,
+                    "hsi_search_seconds": hsi_search_seconds,
+                    "dino_query_seconds": dino_query_seconds,
+                    "rerank_seconds": rerank_seconds,
+                    "total_seconds": time.perf_counter() - run_started_at,
+                },
+                "matches": matches,
+            }
+        finally:
+            cropped_image.close()
+
+    def match_from_paths(
+        self,
+        *,
+        image_path: Path,
+        mask_path: Path,
+        margin: int = 10,
+        provided_bbox: tuple[int, int, int, int] | None = None,
+        filter_values: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not image_path.exists():
+            raise FileNotFoundError(f"Image not found: {image_path}")
+        if not mask_path.exists():
+            raise FileNotFoundError(f"Mask not found: {mask_path}")
+        image = Image.open(image_path).convert("RGB")
+        mask_image = Image.open(mask_path).convert("L")
+        try:
+            return self._run_match(
+                image_array=np.asarray(image),
+                mask_array=np.asarray(mask_image),
+                image_label=str(image_path),
+                mask_label=str(mask_path),
+                margin=margin,
+                provided_bbox=provided_bbox,
+                filter_values=filter_values,
+            )
+        finally:
+            image.close()
+            mask_image.close()
+
+    def match_from_arrays(
+        self,
+        *,
+        image_array: np.ndarray,
+        mask_array: np.ndarray,
+        image_label: str = "<in-memory-image>",
+        mask_label: str = "<in-memory-mask>",
+        margin: int = 10,
+        provided_bbox: tuple[int, int, int, int] | None = None,
+        filter_values: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self._run_match(
+            image_array=image_array,
+            mask_array=mask_array,
+            image_label=image_label,
+            mask_label=mask_label,
+            margin=margin,
+            provided_bbox=provided_bbox,
+            filter_values=filter_values,
+        )
 
 
 def main() -> int:
     args = parse_args()
-    image_path = args.image
-    mask_path = args.mask
+    bbox_args = [args.bbox_x1, args.bbox_y1, args.bbox_x2, args.bbox_y2]
+    provided_bbox: tuple[int, int, int, int] | None = None
+    if any(value is not None for value in bbox_args):
+        if not all(value is not None for value in bbox_args):
+            raise ValueError("When providing bbox coordinates, all of --bbox-x1/--bbox-y1/--bbox-x2/--bbox-y2 are required.")
+        provided_bbox = (int(args.bbox_x1), int(args.bbox_y1), int(args.bbox_x2), int(args.bbox_y2))
 
-    if not image_path.exists():
-        raise FileNotFoundError(f"Image not found: {image_path}")
-    if not mask_path.exists():
-        raise FileNotFoundError(f"Mask not found: {mask_path}")
+    matcher = MaskedRegionTextureMatcher(
+        host=args.host,
+        api_key=args.key,
+        index_name=args.index,
+        method=args.method,
+        h_bins=args.h_bins,
+        s_bins=args.s_bins,
+        i_bins=args.i_bins,
+        hsi_prefilter_limit=args.hsi_prefilter_limit,
+        hsi_dinov2_size=args.hsi_dinov2_size,
+        limit=args.limit,
+        device=args.device,
+        log_server_metrics=args.log_server_metrics,
+    )
+    summary = matcher.match_from_paths(
+        image_path=args.image,
+        mask_path=args.mask,
+        margin=args.margin,
+        provided_bbox=provided_bbox,
+        filter_values={
+            "location": args.filter_location,
+            "application": args.filter_application,
+            "product_category": args.filter_product_category,
+            "material_type": args.filter_material_type,
+            "color": args.filter_color,
+            "brand_name": args.filter_brand_name,
+        },
+    )
 
-    image = Image.open(image_path).convert("RGB")
-    mask_image = Image.open(mask_path).convert("L")
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
-    try:
-        image_array = np.asarray(image)
-        mask_array = np.asarray(mask_image)
-        bbox_args = [args.bbox_x1, args.bbox_y1, args.bbox_x2, args.bbox_y2]
-        if any(value is not None for value in bbox_args):
-            if not all(value is not None for value in bbox_args):
-                raise ValueError("When providing bbox coordinates, all of --bbox-x1/--bbox-y1/--bbox-x2/--bbox-y2 are required.")
-            provided_bbox = (int(args.bbox_x1), int(args.bbox_y1), int(args.bbox_x2), int(args.bbox_y2))
-            cropped, bbox = crop_image_from_bbox(image_array, provided_bbox)
-        else:
-            cropped, bbox = crop_image_from_mask(image_array, mask_array, margin=args.margin)
-        cropped_image = Image.fromarray(cropped.astype(np.uint8))
-
-        device = choose_device(args.device)
-        method = args.method
-        hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
-        embedding: list[float]
-        matches: list[dict[str, Any]]
-        hits: list[dict[str, Any]]
-
-        if method == "gram":
-            gram_extractor = VGGGramExtractor(layer_index=args.gram_layer_index).to(device)
-            gram_extractor.eval()
-            image_transform = transforms.Compose(
-                [
-                    transforms.Resize((224, 224)),
-                    transforms.ToTensor(),
-                    transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-                ]
-            )
-            embedding = compute_gram_embedding(
-                image=cropped_image,
-                gram_extractor=gram_extractor,
-                image_transform=image_transform,
-                device=device,
-                lbp_points=args.lbp_points,
-                lbp_radius=args.lbp_radius,
-            )
-        elif method == "hsi":
-            embedding = compute_hsi_embedding(
-                image=cropped_image,
-                h_bins=args.h_bins,
-                s_bins=args.s_bins,
-                i_bins=args.i_bins,
-            )
-        elif method == "hsi_dinov2":
-            if args.hsi_prefilter_limit <= 0:
-                raise ValueError(f"--hsi-prefilter-limit must be > 0, got {args.hsi_prefilter_limit}.")
-            if args.hsi_dinov2_size <= 0:
-                raise ValueError(f"--hsi-dinov2-size must be > 0, got {args.hsi_dinov2_size}.")
-            hsi_embedding = compute_hsi_embedding(
-                image=cropped_image,
-                h_bins=args.h_bins,
-                s_bins=args.s_bins,
-                i_bins=args.i_bins,
-            )
-            hsi_result = search_meilisearch(
-                args.host,
-                args.key,
-                args.hsi_prefilter_index,
-                hsi_embedding,
-                limit=args.hsi_prefilter_limit,
-            )
-            hsi_hits = hsi_result.get("hits", []) if isinstance(hsi_result, dict) else []
-            candidate_product_ids = extract_unique_product_ids(hsi_hits, args.hsi_prefilter_limit)
-            if not candidate_product_ids:
-                embedding = hsi_embedding
-                hits = []
-                matches = []
-            else:
-                image_processor = AutoImageProcessor.from_pretrained(MODEL_NAME_DINOV2, token=hf_token)
-                model = AutoModel.from_pretrained(MODEL_NAME_DINOV2, token=hf_token)
-                model.to(device)
-                model.eval()
-                query_data = compute_resized_dino_query(
-                    image=cropped_image,
-                    output_size=args.hsi_dinov2_size,
-                    model=model,
-                    processor=image_processor,
-                    device=device,
-                )
-                embedding = query_data["embedding"]
-                query_vec = query_data["vector"]
-                hsi_scores = build_best_hsi_score_map(hsi_hits, args.hsi_prefilter_limit)
-                normalized_hsi_scores: dict[str, float] = {}
-                for product_id, score in hsi_scores.items():
-                    normalized_key = normalize_product_key(product_id)
-                    if not normalized_key:
-                        continue
-                    existing = normalized_hsi_scores.get(normalized_key)
-                    if existing is None or score > existing:
-                        normalized_hsi_scores[normalized_key] = score
-                candidate_docs = search_documents_by_product_ids(
-                    host=args.host,
-                    api_key=args.key,
-                    index_name=args.hsi_dinov2_index,
-                    product_ids=candidate_product_ids,
-                    limit=max(args.hsi_prefilter_limit, len(candidate_product_ids)),
-                )
-                best_by_product_id: dict[str, dict[str, Any]] = {}
-                for doc in candidate_docs:
-                    raw_product_id = doc.get("product_id") or doc.get("id")
-                    if raw_product_id is None:
-                        continue
-                    product_id = str(raw_product_id)
-                    hsi_score = hsi_scores.get(product_id)
-                    if hsi_score is None:
-                        hsi_score = normalized_hsi_scores.get(normalize_product_key(product_id))
-                    if hsi_score is None:
-                        continue
-
-                    candidate_vectors: list[tuple[int | None, list[Any]]] = []
-                    raw_embedding_vectors = doc.get("embedding_vectors")
-                    if isinstance(raw_embedding_vectors, list) and raw_embedding_vectors:
-                        if all(isinstance(value, (int, float)) for value in raw_embedding_vectors):
-                            candidate_vectors.append((0, raw_embedding_vectors))
-                        else:
-                            for vector_index, candidate_vector in enumerate(raw_embedding_vectors):
-                                if isinstance(candidate_vector, list) and candidate_vector:
-                                    candidate_vectors.append((vector_index, candidate_vector))
-                    if not candidate_vectors:
-                        raw_doc_embedding = doc.get("embedding")
-                        if isinstance(raw_doc_embedding, list) and raw_doc_embedding:
-                            candidate_vectors.append((None, raw_doc_embedding))
-                    if not candidate_vectors:
-                        continue
-
-                    best_dino_score_for_doc: float | None = None
-                    best_vector_index_for_doc: int | None = None
-                    for vector_index, candidate_vector in candidate_vectors:
-                        doc_vec = np.asarray(candidate_vector, dtype=np.float32).reshape(-1)
-                        if doc_vec.size != len(embedding):
-                            continue
-                        doc_vec = l2_normalize(doc_vec.reshape(1, -1))[0]
-                        score = float(np.dot(query_vec, doc_vec))
-                        if best_dino_score_for_doc is None or score > best_dino_score_for_doc:
-                            best_dino_score_for_doc = score
-                            best_vector_index_for_doc = vector_index
-
-                    if best_dino_score_for_doc is None:
-                        continue
-                    dino_score = best_dino_score_for_doc
-                    if dino_score < 0.0:
-                        dino_score = 0.0
-                    hsi_score_value = float(hsi_score)
-                    combined_score = hsi_score_value * dino_score
-
-                    reranked = dict(doc)
-                    reranked["hsi_score"] = hsi_score_value
-                    reranked["dinov2_score"] = dino_score
-                    reranked["combined_score"] = combined_score
-                    reranked["score"] = combined_score
-                    reranked["rankingScore"] = combined_score
-                    reranked["best_embedding_index"] = best_vector_index_for_doc
-                    image_names = doc.get("image_names")
-                    if (
-                        isinstance(image_names, list)
-                        and best_vector_index_for_doc is not None
-                        and 0 <= best_vector_index_for_doc < len(image_names)
-                    ):
-                        reranked["best_embedding_image_name"] = image_names[best_vector_index_for_doc]
-
-                    existing = best_by_product_id.get(product_id)
-                    if existing is None or float(existing["combined_score"]) < combined_score:
-                        best_by_product_id[product_id] = reranked
-
-                if candidate_docs and not best_by_product_id:
-                    raise RuntimeError(
-                        "HSI prefilter returned candidates, but none could be reranked with a compatible DINOv2 embedding. "
-                        f"Checked {len(candidate_docs)} candidate documents in index '{args.hsi_dinov2_index}'. "
-                        "Verify product_id alignment and embedding vector dimensions."
-                    )
-
-                hits = sorted(
-                    best_by_product_id.values(),
-                    key=lambda item: float(item["combined_score"]),
-                    reverse=True,
-                )[: args.limit]
-                matches = [format_hybrid_match(hit, index) for index, hit in enumerate(hits, start=1)]
-        elif method == "perspective":
-            image_processor = AutoImageProcessor.from_pretrained(args.perspective_model_name, token=hf_token)
-            model = AutoModel.from_pretrained(args.perspective_model_name, token=hf_token)
-            model.to(device)
-            model.eval()
-
-            gray = np.asarray(cropped_image.convert("L"), dtype=np.uint8)
-            gradient = compute_gradient_magnitude(gray, args.sobel_ksize, args.grad_norm_max)
-            yaw_angles = parse_angle_list(args.yaw_angles)
-            pitch_angles = parse_angle_list(args.pitch_angles)
-
-            collected_hits: list[dict[str, Any]] = []
-            first_embedding: list[float] | None = None
-            for yaw in yaw_angles:
-                for pitch in pitch_angles:
-                    projected = project_gradient(
-                        gradient=gradient,
-                        yaw=yaw,
-                        pitch=pitch,
-                        roll=args.perspective_roll,
-                        output_width=args.perspective_output_width,
-                        output_height=args.perspective_output_height,
-                        focal_px=args.perspective_focal_length,
-                        distance_px=args.perspective_camera_distance,
-                        crop_valid_region=args.perspective_crop_valid_region,
-                    )
-                    projection_embedding = gradient_projection_to_embedding(projected, model, image_processor, device)
-                    if first_embedding is None:
-                        first_embedding = projection_embedding
-                    projection_result = search_meilisearch(args.host, args.key, args.index, projection_embedding, limit=args.limit)
-                    projection_hits = projection_result.get("hits", []) if isinstance(projection_result, dict) else []
-                    collected_hits.extend(projection_hits)
-
-            if first_embedding is None:
-                raise RuntimeError("Perspective method failed to generate any query projection.")
-            embedding = first_embedding
-            hits = merge_projection_hits(collected_hits, args.limit)
-            matches = [format_match(hit, index) for index, hit in enumerate(hits[: args.limit], start=1)]
-        elif method == "dinov2_texture_faiss":
-            try:
-                from scripts.classification.texture_indexer_dinov2_texture_faiss import (
-                    DINOv2TextureEmbedder,
-                    DINOv2TextureSearchIndex,
-                )
-            except ModuleNotFoundError as exc:
-                raise RuntimeError(
-                    "Could not import DINOv2 FAISS texture search module. "
-                    "Run from project root and ensure scripts/classification/texture_indexer_dinov2_texture_faiss.py exists."
-                ) from exc
-
-            faiss_embedder = DINOv2TextureEmbedder(
-                embedding_mode=args.faiss_embedding_mode,
-                input_size=args.faiss_input_size,
-                device=device,
-                batch_size=args.faiss_batch_size,
-            )
-            faiss_search = DINOv2TextureSearchIndex(index_root=args.faiss_index_root, embedder=faiss_embedder)
-            faiss_search.load()
-            query_embedding_np = faiss_embedder.embed_image(cropped_image)
-            embedding = [float(v) for v in query_embedding_np.tolist()]
-            faiss_results = faiss_search.search_by_embedding(query_embedding_np, top_k=args.limit)
-            hits = faiss_results
-            matches = [format_faiss_match(hit, index) for index, hit in enumerate(faiss_results, start=1)]
-        else:
-            model_name = MODEL_NAME_DINOV2 if method == "dinov2" else args.dinov3_model_name
-            image_processor = AutoImageProcessor.from_pretrained(model_name, token=hf_token)
-            model = AutoModel.from_pretrained(model_name, token=hf_token)
-            model.to(device)
-            model.eval()
-            embedding = compute_dino_embedding(cropped_image, model, image_processor, device, method=method, patch_pooling=args.patch_pool)
-        if method not in {"perspective", "hsi_dinov2", "dinov2_texture_faiss"}:
-            result = search_meilisearch(args.host, args.key, args.index, embedding, limit=args.limit)
-            hits = result.get("hits", []) if isinstance(result, dict) else []
-            matches = [format_match(hit, index) for index, hit in enumerate(hits[: args.limit], start=1)]
-
-        summary = {
-            "image": str(image_path),
-            "mask": str(mask_path),
-            "bbox": bbox,
-            "method": method,
-            "embedding_dim": len(embedding),
-            "matches": matches,
-        }
-
-        if args.output:
-            args.output.parent.mkdir(parents=True, exist_ok=True)
-            args.output.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-        output_json = json.dumps(summary, ensure_ascii=True, indent=2) + "\n"
-        sys.stdout.write(output_json)
-        return 0
-    finally:
-        image.close()
-        mask_image.close()
+    output_json = json.dumps(summary, ensure_ascii=True, indent=2) + "\n"
+    sys.stdout.write(output_json)
+    return 0
 
 
 if __name__ == "__main__":

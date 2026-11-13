@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 from typing import Any
 from urllib import error, request
+from urllib.parse import urlparse
 
 import numpy as np
 import torch
@@ -24,6 +25,7 @@ from transformers import AutoImageProcessor, AutoModel
 
 MODEL_NAME = "facebook/dinov2-small"
 DEFAULT_PRODUCT_EXPORT = "texture/lightbeans_main_page_textures.json"
+DEFAULT_FILTER_METADATA_EXPORT = "data/platform-products-production-v2-en.json"
 DEFAULT_TEXTURE_DIR = "texture/views"
 MEILI_INDEX = "lightbeans-texture-dinov2-views"
 DEFAULT_INDEX = MEILI_INDEX
@@ -96,6 +98,74 @@ def load_product_export(path: Path) -> list[dict[str, Any]]:
     if not isinstance(data, list):
         raise ValueError(f"Expected JSON array in {path}")
     return [item for item in data if isinstance(item, dict)]
+
+
+def load_filter_metadata_export(path: Path | None) -> list[dict[str, Any]]:
+    if path is None or not path.exists():
+        return []
+    data = load_json(path)
+    if not isinstance(data, list):
+        raise ValueError(f"Expected JSON array in {path}")
+    return [item for item in data if isinstance(item, dict)]
+
+
+def build_filter_metadata_lookup(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    lookup: dict[str, dict[str, Any]] = {}
+    for item in records:
+        keys: list[str] = []
+        product_id = item.get("id")
+        if product_id is not None:
+            keys.append(f"id:{str(product_id)}")
+
+        brand_slug = item.get("brandSlug")
+        product_slug = item.get("productSlug")
+        if isinstance(brand_slug, str) and isinstance(product_slug, str):
+            keys.append(f"url:{brand_slug.strip().lower()}/{product_slug.strip().lower()}")
+
+        preview_key = extract_texture_id(item.get("previewPath"))
+        if preview_key:
+            keys.append(f"tex:{preview_key}")
+
+        for key in keys:
+            lookup[key] = item
+    return lookup
+
+
+def normalize_product_url_key(url: Any) -> str | None:
+    if not isinstance(url, str):
+        return None
+    raw = url.strip()
+    if not raw:
+        return None
+    parsed = urlparse(raw)
+    path = parsed.path or raw
+    marker = "/texture/"
+    idx = path.find(marker)
+    if idx < 0:
+        return None
+    suffix = path[idx + len(marker) :].strip("/")
+    parts = [part.strip().lower() for part in suffix.split("/") if part.strip()]
+    if len(parts) < 2:
+        return None
+    return f"{parts[0]}/{parts[1]}"
+
+
+def extract_texture_id(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    marker = "/textures/"
+    if marker in raw:
+        suffix = raw.split(marker, 1)[1].strip("/")
+        parts = [part for part in suffix.split("/") if part]
+        if parts:
+            return parts[0].lower()
+    parts = [part for part in raw.strip("/").split("/") if part]
+    if parts:
+        return parts[0].lower()
+    return None
 
 
 def load_mapping(mapping_path: Path | None) -> dict[str, Any]:
@@ -171,21 +241,119 @@ def collect_view_folders(texture_dir: Path) -> list[tuple[Path, list[Path]]]:
     return [(folder, sorted(folder_to_images[folder])) for folder in folders]
 
 
+def build_view_folder_lookup(view_folders: list[tuple[Path, list[Path]]]) -> dict[str, tuple[Path, list[Path]]]:
+    lookup: dict[str, tuple[Path, list[Path]]] = {}
+    for folder_path, view_paths in view_folders:
+        lookup[normalize_stem(folder_path.name)] = (folder_path, view_paths)
+    return lookup
+
+
+def resolve_view_folder_for_record(
+    record: dict[str, Any],
+    folder_lookup: dict[str, tuple[Path, list[Path]]],
+) -> tuple[Path, list[Path]] | None:
+    candidates: list[str] = []
+
+    image_name = record.get("image_name")
+    if isinstance(image_name, str) and image_name.strip():
+        candidates.append(normalize_stem(image_name))
+
+    image_url = record.get("image_url")
+    if isinstance(image_url, str) and image_url.strip():
+        filename = image_url.rstrip("/").split("/")[-1]
+        if filename:
+            candidates.append(normalize_stem(filename))
+
+    source_image_name = record.get("source_image_name")
+    if isinstance(source_image_name, str) and source_image_name.strip():
+        candidates.append(normalize_stem(source_image_name))
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        folder = folder_lookup.get(candidate)
+        if folder is not None:
+            return folder
+    return None
+
+
 def build_product_lookup(products: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     lookup: dict[str, dict[str, Any]] = {}
     for product in products:
+        product_id = product.get("id")
+        if product_id is not None:
+            lookup[f"id:{str(product_id)}"] = product
+
+        link_key = normalize_product_url_key(product.get("link"))
+        if link_key:
+            lookup[f"url:{link_key}"] = product
+
         image_name = product.get("image_name")
         if isinstance(image_name, str) and image_name.strip():
-            lookup.setdefault(normalize_stem(image_name), product)
+            lookup.setdefault(f"stem:{normalize_stem(image_name)}", product)
+
         image_url = product.get("image_url")
         if isinstance(image_url, str) and image_url.strip():
             filename = image_url.rstrip("/").split("/")[-1]
             if filename:
-                lookup.setdefault(normalize_stem(filename), product)
+                lookup.setdefault(f"stem:{normalize_stem(filename)}", product)
+            texture_key = extract_texture_id(image_url)
+            if texture_key:
+                lookup[f"tex:{texture_key}"] = product
+
         preview_path = normalize_preview_path(product.get("previewPath"))
         if preview_path:
-            lookup.setdefault(normalize_stem(preview_path), product)
+            lookup.setdefault(f"stem:{normalize_stem(preview_path)}", product)
+            preview_texture_key = extract_texture_id(preview_path)
+            if preview_texture_key:
+                lookup[f"tex:{preview_texture_key}"] = product
     return lookup
+
+
+def resolve_filter_metadata(product_record: dict[str, Any], metadata_lookup: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    product_id = product_record.get("id")
+    if product_id is not None:
+        match = metadata_lookup.get(f"id:{str(product_id)}")
+        if match is not None:
+            return match
+
+    link_key = normalize_product_url_key(product_record.get("link"))
+    if link_key:
+        match = metadata_lookup.get(f"url:{link_key}")
+        if match is not None:
+            return match
+
+    texture_key = extract_texture_id(product_record.get("image_url"))
+    if texture_key:
+        match = metadata_lookup.get(f"tex:{texture_key}")
+        if match is not None:
+            return match
+
+    return {}
+
+
+def resolve_product_export_record(metadata_record: dict[str, Any], product_lookup: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    product_id = metadata_record.get("id")
+    if product_id is not None:
+        match = product_lookup.get(f"id:{str(product_id)}")
+        if match is not None:
+            return match
+
+    brand_slug = metadata_record.get("brandSlug")
+    product_slug = metadata_record.get("productSlug")
+    if isinstance(brand_slug, str) and isinstance(product_slug, str):
+        match = product_lookup.get(f"url:{brand_slug.strip().lower()}/{product_slug.strip().lower()}")
+        if match is not None:
+            return match
+
+    preview_texture_key = extract_texture_id(metadata_record.get("previewPath"))
+    if preview_texture_key:
+        match = product_lookup.get(f"tex:{preview_texture_key}")
+        if match is not None:
+            return match
+    return {}
 
 
 def wait_for_task(host: str, api_key: str | None, task_uid: int, timeout_seconds: int = 600, poll_seconds: float = 0.5) -> None:
@@ -240,6 +408,13 @@ def ensure_index(host: str, api_key: str | None, index_name: str, primary_key: s
             "image_url",
             "image_name",
             "source_image_name",
+            "brandName",
+            "productCategory",
+            "materialType",
+            "location",
+            "application",
+            "material_type",
+            "color",
         ],
         "filterableAttributes": [
             "id",
@@ -249,6 +424,14 @@ def ensure_index(host: str, api_key: str | None, index_name: str, primary_key: s
             "image_url",
             "image_name",
             "source_image_name",
+            "brandName",
+            "location",
+            "application",
+            "productCategory",
+            "materialType",
+            "material_type",
+            "color",
+            "locale",
         ],
         "sortableAttributes": ["product_id", "id"],
         "rankingRules": [
@@ -350,26 +533,42 @@ def build_folder_document(
     if not view_embeddings:
         raise ValueError(f"No embeddings generated for folder: {folder_path}")
 
-    record = product or {}
+    record = dict(product or {})
     product_id = record.get("id") or record.get("image_name") or record.get("link") or folder_id
     product_id = sanitize_meilisearch_id(product_id)
     representative_embedding = average_embedding(view_embeddings)
     source_image_name = record.get("image_name") or folder_path.name
+    link = record.get("link") or build_product_url(record.get("brandSlug"), record.get("productSlug"))
+    image_url = record.get("image_url")
+    if not image_url and isinstance(record.get("previewPath"), str):
+        preview_path = normalize_preview_path(record.get("previewPath"))
+        if preview_path:
+            image_url = f"https://cdn.lightbeans.com/textures/{preview_path.lstrip('/')}"
+    record["link"] = link
+    record["image_url"] = image_url or ""
 
     return {
         "id": folder_id,
         "folder_name": folder_path.name,
         "folder_path": folder_path.as_posix(),
         "product_id": product_id,
-        "name": record.get("name"),
-        "link": record.get("link"),
-        "image_url": record.get("image_url") or "",
+        "name": record.get("name") or record.get("productName"),
+        "link": link,
+        "image_url": image_url or "",
         "source_image_name": source_image_name,
         "image_names": [path.name for path in view_paths],
         "image_paths": [path.as_posix() for path in view_paths],
         "view_count": len(view_paths),
         "features": build_features(record),
-        "embedding": representative_embedding,
+        "brandName": record.get("brandName") or record.get("brand_name"),
+        "location": as_list(record.get("location")),
+        "application": as_list(record.get("application")),
+        "productCategory": as_list(record.get("productCategory") or record.get("product_category")),
+        "materialType": as_list(record.get("materialType") or record.get("material_type")),
+        "product_category": as_list(record.get("productCategory") or record.get("product_category")),
+        "material_type": as_list(record.get("materialType") or record.get("material_type")),
+        "color": as_list(record.get("color")),
+        "locale": record.get("locale"),
         "embedding_vectors": view_embeddings,
         "_vectors": {"default": representative_embedding},
     }
@@ -539,16 +738,29 @@ def parse_args() -> argparse.Namespace:
     project_root = Path(__file__).resolve().parents[2]
     env_values = load_env(project_root / ".env")
     parser = argparse.ArgumentParser(description="Index DINOv2 texture embeddings into Meilisearch.")
-    parser.add_argument("--product-export", type=Path, default=Path(DEFAULT_PRODUCT_EXPORT), help="Product export JSON file.")
+    parser.add_argument(
+        "--product-export",
+        type=Path,
+        default=Path(DEFAULT_PRODUCT_EXPORT),
+        help="Optional product export JSON used to enrich image_name/link/image_url matching.",
+    )
+    parser.add_argument(
+        "--filter-metadata-export",
+        type=Path,
+        default=Path(DEFAULT_FILTER_METADATA_EXPORT),
+        help="Product metadata JSON used as the primary source for indexed documents.",
+    )
     parser.add_argument("--textures-dir", type=Path, default=Path(DEFAULT_TEXTURE_DIR), help="Directory containing texture images to index (e.g. generated views).")
-    parser.add_argument("--mapping-json", type=Path, default=None, help="Optional file-to-product mapping JSON for legacy texture exports.")
     parser.add_argument("--host", default=env_values.get("MEILI_HOST") or os.getenv("MEILI_HOST") or "http://localhost:7700", help="Meilisearch host.")
     parser.add_argument("--key", default=env_values.get("MEILI_KEY") or os.getenv("MEILI_KEY"), help="Meilisearch API key.")
     parser.add_argument("--index", default=env_values.get("MEILI_INDEX") or os.getenv("MEILI_INDEX") or MEILI_INDEX, help="Target Meilisearch index name.")
     parser.add_argument("--limit", type=int, default=0, help="Process only the first N products (0 = all).")
-    parser.add_argument("--batch-size", type=int, default=8, help="Image batch size for DINOv2 inference.")
     parser.add_argument("--upload-batch-size", type=int, default=256, help="Number of documents uploaded per Meilisearch request.")
-    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"], help="Device for DINOv2 inference.")
+    parser.add_argument("--trace", dest="trace", action="store_true", help="Print progression traces while indexing.")
+    parser.add_argument("--no-trace", dest="trace", action="store_false", help="Disable progression traces while indexing.")
+    parser.set_defaults(trace=True)
+    parser.add_argument("--trace-every", type=int, default=100, help="Emit progress every N metadata records when tracing.")
+    parser.add_argument("--device", default="cuda", choices=["auto", "cpu", "cuda"], help="Device for DINOv2 inference.")
     parser.add_argument("--query-image", type=Path, help="Optional image path used to run a vector search after indexing.")
     parser.add_argument("--search-limit", type=int, default=10, help="Number of hits to return from the optional vector search.")
     parser.add_argument("--search-output", type=Path, help="Optional output JSON path for viewer-compatible search payload.")
@@ -582,9 +794,8 @@ def choose_device(device_arg: str) -> str:
 
 def main() -> int:
     args = parse_args()
-    product_export = args.product_export
-    if not product_export.exists():
-        raise FileNotFoundError(f"Product export not found: {product_export}")
+    if not args.filter_metadata_export.exists():
+        raise FileNotFoundError(f"Filter metadata export not found: {args.filter_metadata_export}")
 
     if not args.textures_dir.exists():
         raise FileNotFoundError(f"Textures directory not found: {args.textures_dir}")
@@ -596,15 +807,21 @@ def main() -> int:
     image_model.to(device)
     image_model.eval()
 
-    products = load_product_export(product_export)
+    metadata_records = load_filter_metadata_export(args.filter_metadata_export)
     if args.limit > 0:
-        products = products[: args.limit]
-    product_lookup = build_product_lookup(products)
+        metadata_records = metadata_records[: args.limit]
+    total_records = len(metadata_records)
+    metadata_lookup = build_filter_metadata_lookup(metadata_records)
+
+    product_records: list[dict[str, Any]] = []
+    if args.product_export.exists():
+        product_records = load_product_export(args.product_export)
+    product_lookup = build_product_lookup(product_records)
 
     if args.upload_batch_size <= 0:
         raise ValueError(f"--upload-batch-size must be > 0, got {args.upload_batch_size}.")
-    if args.batch_size <= 0:
-        raise ValueError(f"--batch-size must be > 0, got {args.batch_size}.")
+    if args.trace_every <= 0:
+        raise ValueError(f"--trace-every must be > 0, got {args.trace_every}.")
     if args.expected_views_per_folder <= 0:
         raise ValueError(
             f"--expected-views-per-folder must be > 0, got {args.expected_views_per_folder}."
@@ -619,28 +836,70 @@ def main() -> int:
     indexed_folders = 0
     total_indexed_views = 0
     skipped_with_invalid_view_count = 0
+    skipped_without_product_match = 0
+    skipped_without_folder_match = 0
+    skipped_duplicate_folder_match = 0
     view_folders = collect_view_folders(args.textures_dir)
     if not view_folders:
         raise RuntimeError(f"No supported images found in {args.textures_dir} (excluding contact_sheet files).")
+    total_folders = len(view_folders)
+    folder_lookup = build_view_folder_lookup(view_folders)
 
     vector_dimensions: int | None = None
     index_initialized = False
-    for folder_path, view_paths in view_folders:
+    processed_folder_ids: set[str] = set()
+    if args.trace:
+        print(
+            "[trace] Starting DINOv2 indexing "
+            f"(metadata={total_records}, product_export={len(product_records)}, texture_folders={total_folders})."
+        )
+
+    for record_index, metadata_record in enumerate(metadata_records, start=1):
+        product_record = resolve_product_export_record(metadata_record, product_lookup)
+        if product_record is None or not product_record:
+            skipped_without_product_match += 1
+            if args.trace:
+                print(f"[trace] Skipped {record_index}/{total_records}: no matching product export entry for metadata id '{metadata_record.get('id')}'.")
+            continue
+        metadata_hit = resolve_filter_metadata(product_record, metadata_lookup)
+        resolved_record = dict(metadata_record)
+        resolved_record.update(metadata_hit)
+        resolved_record.update(product_record)
+        resolved = resolve_view_folder_for_record(resolved_record, folder_lookup)
+        if resolved is None:
+            skipped_without_folder_match += 1
+            if args.trace:
+                print(f"[trace] Skipped {record_index}/{total_records}: no matching view folder for metadata id '{metadata_record.get('id')}'.")
+            continue
+        folder_path, view_paths = resolved
+
         if len(view_paths) != args.expected_views_per_folder:
             skipped_with_invalid_view_count += 1
-            print(
-                f"Skipping folder '{folder_path.name}': expected "
-                f"{args.expected_views_per_folder} views but found {len(view_paths)}."
-            )
+            if args.trace:
+                print(
+                    f"[trace] Skipped {record_index}/{total_records}: folder '{folder_path.name}' "
+                    f"expected {args.expected_views_per_folder} views but found {len(view_paths)}."
+                )
             continue
 
         folder_id = sanitize_meilisearch_id(folder_path.name)
-        source_stem = normalize_stem(folder_path.name)
-        record = product_lookup.get(source_stem)
-        if record is not None and "id" not in record:
-            fallback_id = record.get("image_name") or record.get("link") or record.get("image_url")
+        if folder_id in processed_folder_ids:
+            skipped_duplicate_folder_match += 1
+            if args.trace:
+                print(f"[trace] Skipped {record_index}/{total_records}: duplicate folder match '{folder_path.name}'.")
+            continue
+        processed_folder_ids.add(folder_id)
+
+        if "id" not in resolved_record:
+            fallback_id = (
+                resolved_record.get("id")
+                or resolved_record.get("image_name")
+                or resolved_record.get("link")
+                or resolved_record.get("image_url")
+                or resolved_record.get("previewPath")
+            )
             if fallback_id:
-                record["id"] = sanitize_meilisearch_id(fallback_id)
+                resolved_record["id"] = sanitize_meilisearch_id(fallback_id)
 
         with ThreadPoolExecutor(max_workers=len(view_paths)) as folder_executor:
             view_embeddings = list(
@@ -654,7 +913,7 @@ def main() -> int:
             folder_path=folder_path,
             view_paths=view_paths,
             view_embeddings=view_embeddings,
-            product=record,
+            product=resolved_record,
         )
         if vector_dimensions is None:
             vector_dimensions = len(doc["embedding"])
@@ -665,6 +924,14 @@ def main() -> int:
         upload_buffer.append(doc)
         indexed_folders += 1
         total_indexed_views += len(view_paths)
+        if args.trace and (record_index == 1 or record_index % args.trace_every == 0 or record_index == total_records):
+            print(
+                f"[trace] Progress {record_index}/{total_records}: indexed={indexed_folders}, "
+                f"skipped_no_product={skipped_without_product_match}, "
+                f"skipped_no_folder={skipped_without_folder_match}, "
+                f"skipped_invalid_views={skipped_with_invalid_view_count}, "
+                f"skipped_duplicates={skipped_duplicate_folder_match}."
+            )
         if len(upload_buffer) >= args.upload_batch_size:
             upload_documents_with_payload_limit(
                 args.host,
@@ -674,12 +941,13 @@ def main() -> int:
                 max_payload_bytes=max_upload_payload_bytes,
             )
             upload_buffer.clear()
-            print(f"Uploaded {indexed_folders} / {len(view_folders)} folder documents...")
+            if args.trace:
+                print(f"[trace] Uploaded {indexed_folders} / {total_records} folder documents.")
 
     if indexed_folders == 0:
         raise RuntimeError(
             f"No indexable view folders found. "
-            f"Checked {len(view_folders)} folders in {args.textures_dir} "
+            f"Checked {total_records} metadata records in {args.filter_metadata_export} "
             f"with expected view count {args.expected_views_per_folder}."
         )
 
@@ -698,6 +966,9 @@ def main() -> int:
         f"in Meilisearch index '{args.index}'."
     )
     print(f"Skipped {skipped_with_invalid_view_count} folders with invalid view count.")
+    print(f"Skipped {skipped_without_product_match} metadata records without matching product export entry.")
+    print(f"Skipped {skipped_without_folder_match} metadata records without matching view folder.")
+    print(f"Skipped {skipped_duplicate_folder_match} duplicate metadata matches for already indexed folders.")
 
     if args.query_image:
         if not args.query_image.exists():

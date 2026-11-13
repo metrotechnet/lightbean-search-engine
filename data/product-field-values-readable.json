@@ -1,0 +1,470 @@
+{
+  "location": [
+    {
+      "key": "exterior",
+      "value": "Exterior"
+    },
+    {
+      "key": "interior",
+      "value": "Interior"
+    }
+  ],
+  "application": [
+    {
+      "key": "cabinet",
+      "value": "Cabinet"
+    },
+    {
+      "key": "countertop",
+      "value": "Countertop"
+    },
+    {
+      "key": "door",
+      "value": "Door"
+    },
+    {
+      "key": "exterior-ceiling-and-soffit",
+      "value": "Exterior Ceiling and Soffit"
+    },
+    {
+      "key": "exterior-wall-cladding",
+      "value": "Exterior Wall Cladding"
+    },
+    {
+      "key": "furniture-fixture-and-equipment",
+      "value": "Furniture, Fixture & Equipment"
+    },
+    {
+      "key": "hardscaping",
+      "value": "Hardscaping"
+    },
+    {
+      "key": "indoor-flooring",
+      "value": "Indoor Flooring"
+    },
+    {
+      "key": "interior-ceiling",
+      "value": "Interior Ceiling"
+    },
+    {
+      "key": "interior-wall-cladding",
+      "value": "Interior Wall Cladding"
+    },
+    {
+      "key": "outdoor-flooring",
+      "value": "Outdoor Flooring"
+    }
+  ],
+  "productCategory": [
+    {
+      "key": "board-and-batten",
+      "value": "Board & Batten"
+    },
+    {
+      "key": "decking",
+      "value": "Decking"
+    },
+    {
+      "key": "interior-door",
+      "value": "Interior Door"
+    },
+    {
+      "key": "masonry",
+      "value": "Masonry"
+    },
+    {
+      "key": "outdoor-rug-and-artificial-turf",
+      "value": "Outdoor Rug & Artificial Turf"
+    },
+    {
+      "key": "panel",
+      "value": "Panel"
+    },
+    {
+      "key": "paneling",
+      "value": "Paneling"
+    },
+    {
+      "key": "paver",
+      "value": "Paver"
+    },
+    {
+      "key": "plank",
+      "value": "Plank"
+    },
+    {
+      "key": "retaining-wall",
+      "value": "Retaining Wall"
+    },
+    {
+      "key": "shingle",
+      "value": "Shingle"
+    },
+    {
+      "key": "tile",
+      "value": "Tile"
+    }
+  ],
+  "materialType": [
+    {
+      "key": "acoustic-textile",
+      "value": "Acoustic Textile"
+    },
+    {
+      "key": "brick",
+      "value": "Brick"
+    },
+    {
+      "key": "carpet",
+      "value": "Carpet"
+    },
+    {
+      "key": "ceramic",
+      "value": "Ceramic"
+    },
+    {
+      "key": "charred-or-thermally-modified-wood",
+      "value": "Charred or Thermally Modified Wood"
+    },
+    {
+      "key": "composite-and-polymer",
+      "value": "Composite and Polymer"
+    },
+    {
+      "key": "engineered-wood",
+      "value": "Engineered Wood"
+    },
+    {
+      "key": "fiber-cement",
+      "value": "Fiber Cement"
+    },
+    {
+      "key": "granite",
+      "value": "Granite"
+    },
+    {
+      "key": "laminate",
+      "value": "Laminate"
+    },
+    {
+      "key": "laminate-hpl",
+      "value": "Laminate (HPL)"
+    },
+    {
+      "key": "lightweight-concrete",
+      "value": "Lightweight Concrete"
+    },
+    {
+      "key": "manufactured-stone",
+      "value": "Manufactured Stone"
+    },
+    {
+      "key": "marble",
+      "value": "Marble"
+    },
+    {
+      "key": "mdf",
+      "value": "MDF"
+    },
+    {
+      "key": "melamine-panel-tfl",
+      "value": "Melamine Panel (TFL)"
+    },
+    {
+      "key": "metal",
+      "value": "Metal"
+    },
+    {
+      "key": "natural-stone",
+      "value": "Natural Stone"
+    },
+    {
+      "key": "plywood",
+      "value": "Plywood"
+    },
+    {
+      "key": "polymer-on-wood-core",
+      "value": "Polymer on Wood Core"
+    },
+    {
+      "key": "porcelain",
+      "value": "Porcelain"
+    },
+    {
+      "key": "solid-wood",
+      "value": "Solid Wood"
+    },
+    {
+      "key": "terracotta",
+      "value": "Terracotta"
+    },
+    {
+      "key": "textile",
+      "value": "Textile"
+    },
+    {
+      "key": "vinyl",
+      "value": "Vinyl"
+    }
+  ],
+  "color": [
+    {
+      "key": "amber",
+      "value": "Amber"
+    },
+    {
+      "key": "beige",
+      "value": "Beige"
+    },
+    {
+      "key": "black",
+      "value": "Black"
+    },
+    {
+      "key": "blend-various-shades",
+      "value": "Blend / Various Shades"
+    },
+    {
+      "key": "blue",
+      "value": "Blue"
+    },
+    {
+      "key": "bronze",
+      "value": "Bronze"
+    },
+    {
+      "key": "brown",
+      "value": "Brown"
+    },
+    {
+      "key": "copper",
+      "value": "Copper"
+    },
+    {
+      "key": "dark-brown",
+      "value": "Dark Brown"
+    },
+    {
+      "key": "dark-grey",
+      "value": "Dark Grey"
+    },
+    {
+      "key": "golden",
+      "value": "Golden"
+    },
+    {
+      "key": "green",
+      "value": "Green"
+    },
+    {
+      "key": "grey",
+      "value": "Grey"
+    },
+    {
+      "key": "light-brown",
+      "value": "Light Brown"
+    },
+    {
+      "key": "light-grey",
+      "value": "Light Grey"
+    },
+    {
+      "key": "medium-brown",
+      "value": "Medium Brown"
+    },
+    {
+      "key": "natural",
+      "value": "Natural"
+    },
+    {
+      "key": "orange",
+      "value": "Orange"
+    },
+    {
+      "key": "red",
+      "value": "Red"
+    },
+    {
+      "key": "rust",
+      "value": "Rust"
+    },
+    {
+      "key": "solid",
+      "value": "Solid"
+    },
+    {
+      "key": "taupe",
+      "value": "Taupe"
+    },
+    {
+      "key": "white",
+      "value": "White"
+    },
+    {
+      "key": "wood-effect",
+      "value": "Wood Effect"
+    },
+    {
+      "key": "yellow",
+      "value": "Yellow"
+    }
+  ],
+  "brandName": [
+    {
+      "key": "alexandra-hardwood-flooring",
+      "value": "Alexandra Hardwood Flooring"
+    },
+    {
+      "key": "aluzion",
+      "value": "Aluzion"
+    },
+    {
+      "key": "bamboo-design",
+      "value": "Bamboo Design"
+    },
+    {
+      "key": "blackwood-siding",
+      "value": "Blackwood Siding"
+    },
+    {
+      "key": "ceragres",
+      "value": "Ceragres"
+    },
+    {
+      "key": "ceratec",
+      "value": "Ceratec"
+    },
+    {
+      "key": "ciot-legno",
+      "value": "Ciot Legno"
+    },
+    {
+      "key": "dekko-concrete",
+      "value": "Dekko Concrete"
+    },
+    {
+      "key": "denali-hardwood-floors",
+      "value": "Denali Hardwood Floors"
+    },
+    {
+      "key": "european-company",
+      "value": "European Company"
+    },
+    {
+      "key": "facings-of-america",
+      "value": "Facings of America"
+    },
+    {
+      "key": "feltkutur",
+      "value": "Feltkütur"
+    },
+    {
+      "key": "glacier-millworks",
+      "value": "Glacier Millworks"
+    },
+    {
+      "key": "goodfellow",
+      "value": "Goodfellow"
+    },
+    {
+      "key": "kentwood-by-metropolitan",
+      "value": "Kentwood by Metropolitan"
+    },
+    {
+      "key": "maibec",
+      "value": "Maibec"
+    },
+    {
+      "key": "mile-r-stone",
+      "value": "MILE®stone"
+    },
+    {
+      "key": "millboard",
+      "value": "Millboard"
+    },
+    {
+      "key": "montana-timber-products",
+      "value": "Montana Timber Products"
+    },
+    {
+      "key": "newtechwood-canada",
+      "value": "NewTechWood Canada"
+    },
+    {
+      "key": "pierres-royales",
+      "value": "Pierres Royales"
+    },
+    {
+      "key": "pionite-a-panolam-brand",
+      "value": "Pionite a Panolam Brand"
+    },
+    {
+      "key": "planchers-1867",
+      "value": "Planchers 1867"
+    },
+    {
+      "key": "planchers-pg",
+      "value": "Planchers PG"
+    },
+    {
+      "key": "polycor-masonry",
+      "value": "Polycor Masonry"
+    },
+    {
+      "key": "polycor-pavers",
+      "value": "Polycor Pavers"
+    },
+    {
+      "key": "preverco",
+      "value": "Preverco"
+    },
+    {
+      "key": "real-wood-floors",
+      "value": "Real Wood Floors"
+    },
+    {
+      "key": "rialux",
+      "value": "Rialux"
+    },
+    {
+      "key": "rinox",
+      "value": "Rinox"
+    },
+    {
+      "key": "sbc-cedar",
+      "value": "SBC Cedar"
+    },
+    {
+      "key": "st-laurent",
+      "value": "St-Laurent"
+    },
+    {
+      "key": "sublime",
+      "value": "Sublime"
+    },
+    {
+      "key": "tafisa",
+      "value": "Tafisa"
+    },
+    {
+      "key": "venture-carpets",
+      "value": "Venture Carpets"
+    },
+    {
+      "key": "vetter-stone",
+      "value": "Vetter Stone"
+    },
+    {
+      "key": "watsontown-brick",
+      "value": "Watsontown Brick"
+    },
+    {
+      "key": "western-states-metal-roofing",
+      "value": "Western States Metal Roofing"
+    },
+    {
+      "key": "willki",
+      "value": "Willki"
+    }
+  ]
+}

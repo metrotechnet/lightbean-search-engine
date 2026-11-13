@@ -11,13 +11,15 @@ import time
 from pathlib import Path
 from typing import Any
 from urllib import error, request
+from urllib.parse import urlparse
 
 import numpy as np
 from PIL import Image
 
 DEFAULT_PRODUCT_EXPORT = "texture/lightbeans_main_page_textures.json"
 DEFAULT_TEXTURE_DIR = "texture/main_page"
-MEILI_INDEX = "lightbeans-texture2-hsi"
+DEFAULT_FILTER_METADATA_EXPORT = "data/platform-products-production-v2-en.json"
+MEILI_INDEX = "lightbeans-texture-hsi"
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -79,6 +81,119 @@ def load_product_export(path: Path) -> list[dict[str, Any]]:
     if not isinstance(data, list):
         raise ValueError(f"Expected JSON array in {path}")
     return [item for item in data if isinstance(item, dict)]
+
+
+def as_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def normalize_product_url_key(url: Any) -> str | None:
+    if not isinstance(url, str):
+        return None
+    raw = url.strip()
+    if not raw:
+        return None
+    parsed = urlparse(raw)
+    path = parsed.path or raw
+    marker = "/texture/"
+    idx = path.find(marker)
+    if idx < 0:
+        return None
+    suffix = path[idx + len(marker) :].strip("/")
+    parts = [part.strip().lower() for part in suffix.split("/") if part.strip()]
+    if len(parts) < 2:
+        return None
+    return f"{parts[0]}/{parts[1]}"
+
+
+def extract_texture_id(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+
+    marker = "/textures/"
+    if marker in raw:
+        suffix = raw.split(marker, 1)[1].strip("/")
+        parts = [part for part in suffix.split("/") if part]
+        if parts:
+            return parts[0].lower()
+
+    parts = [part for part in raw.strip("/").split("/") if part]
+    if parts:
+        return parts[0].lower()
+    return None
+
+
+def load_filter_metadata_export(path: Path | None) -> list[dict[str, Any]]:
+    if path is None or not path.exists():
+        return []
+    payload = load_json(path)
+    if not isinstance(payload, list):
+        return []
+    return [item for item in payload if isinstance(item, dict)]
+
+
+def build_product_export_lookup(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    lookup: dict[str, dict[str, Any]] = {}
+    for record in records:
+        keys: list[str] = []
+        product_id = record.get("id")
+        if product_id is not None:
+            keys.append(f"id:{str(product_id)}")
+
+        link_key = normalize_product_url_key(record.get("link"))
+        if link_key:
+            keys.append(f"url:{link_key}")
+
+        texture_key = extract_texture_id(record.get("image_url"))
+        if texture_key:
+            keys.append(f"tex:{texture_key}")
+
+        for key in keys:
+            lookup[key] = record
+    return lookup
+
+
+def resolve_product_export_record(metadata_record: dict[str, Any], product_lookup: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    product_id = metadata_record.get("id")
+    if product_id is not None:
+        match = product_lookup.get(f"id:{str(product_id)}")
+        if match is not None:
+            return match
+
+    brand_slug = metadata_record.get("brandSlug")
+    product_slug = metadata_record.get("productSlug")
+    if isinstance(brand_slug, str) and isinstance(product_slug, str):
+        key = f"url:{brand_slug.strip().lower()}/{product_slug.strip().lower()}"
+        match = product_lookup.get(key)
+        if match is not None:
+            return match
+
+    texture_key = extract_texture_id(metadata_record.get("previewPath"))
+    if texture_key:
+        match = product_lookup.get(f"tex:{texture_key}")
+        if match is not None:
+            return match
+
+    return {}
+
+
+def build_product_url(brand_slug: Any, product_slug: Any) -> str | None:
+    if not isinstance(brand_slug, str) or not isinstance(product_slug, str):
+        return None
+    brand = brand_slug.strip().strip("/")
+    product = product_slug.strip().strip("/")
+    if not brand or not product:
+        return None
+    return f"https://lightbeans.com/en/texture/{brand}/{product}"
 
 
 def load_mapping(mapping_path: Path | None) -> dict[str, Any]:
@@ -175,8 +290,38 @@ def ensure_index(host: str, api_key: str | None, index_name: str, vector_dimensi
             raise
 
     settings: dict[str, Any] = {
-        "searchableAttributes": ["name", "link", "image_url", "image_name"],
-        "filterableAttributes": ["product_id", "name", "link", "image_url", "image_name"],
+        "searchableAttributes": [
+            "name",
+            "link",
+            "image_url",
+            "image_name",
+            "brandName",
+            "brand_name",
+            "productCategory",
+            "materialType",
+            "location",
+            "application",
+            "product_category",
+            "material_type",
+            "color",
+        ],
+        "filterableAttributes": [
+            "product_id",
+            "name",
+            "link",
+            "image_url",
+            "image_name",
+            "brandName",
+            "brand_name",
+            "location",
+            "application",
+            "productCategory",
+            "materialType",
+            "product_category",
+            "material_type",
+            "color",
+            "locale",
+        ],
         "sortableAttributes": ["product_id"],
         "rankingRules": ["words", "typo", "proximity", "attribute", "sort", "exactness"],
     }
@@ -253,24 +398,56 @@ def build_features(record: dict[str, Any]) -> list[str]:
     return output
 
 
-def build_document(product: dict[str, Any], image_path: Path, vector: list[float]) -> dict[str, Any]:
+def build_document(
+    product: dict[str, Any],
+    image_path: Path,
+    vector: list[float],
+    metadata_record: dict[str, Any],
+) -> dict[str, Any]:
     raw_product_id = product.get("id") or product.get("image_name") or product.get("link") or image_path.stem
     product_id = sanitize_meilisearch_id(raw_product_id)
+    merged = dict(metadata_record)
+    merged.update(product)
+    link = merged.get("link") or build_product_url(merged.get("brandSlug"), merged.get("productSlug"))
+    image_url = merged.get("image_url")
+    if not image_url and isinstance(merged.get("previewPath"), str):
+        preview_path = normalize_preview_path(merged.get("previewPath"))
+        if preview_path:
+            image_url = f"https://cdn.lightbeans.com/textures/{preview_path.lstrip('/')}"
+    merged["link"] = link
+    merged["image_url"] = image_url or ""
     return {
         "product_id": product_id,
         "id": product_id,
-        "name": product.get("name"),
-        "link": product.get("link"),
-        "image_url": product.get("image_url") or "",
-        "image_name": product.get("image_name") or image_path.name,
+        "name": merged.get("name") or merged.get("productName"),
+        "link": link,
+        "image_url": image_url or "",
+        "image_name": merged.get("image_name") or image_path.name,
         "image_path": image_path.as_posix(),
-        "features": build_features(product),
+        "features": build_features(merged),
+        "brandName": merged.get("brandName") or merged.get("brand_name"),
+        "brand_name": merged.get("brandName") or merged.get("brand_name"),
+        "location": as_list(merged.get("location")),
+        "application": as_list(merged.get("application")),
+        "productCategory": as_list(merged.get("productCategory") or merged.get("product_category")),
+        "materialType": as_list(merged.get("materialType") or merged.get("material_type")),
+        "product_category": as_list(merged.get("productCategory") or merged.get("product_category")),
+        "material_type": as_list(merged.get("materialType") or merged.get("material_type")),
+        "color": as_list(merged.get("color")),
+        "locale": merged.get("locale"),
         "embedding": vector,
         "_vectors": {"default": vector},
     }
 
 
-def upload_documents(host: str, api_key: str | None, index_name: str, documents: list[dict[str, Any]], batch_size: int = 100) -> None:
+def upload_documents(
+    host: str,
+    api_key: str | None,
+    index_name: str,
+    documents: list[dict[str, Any]],
+    batch_size: int = 100,
+    trace: bool = False,
+) -> None:
     if batch_size <= 0:
         raise ValueError(f"batch_size must be > 0, got {batch_size}.")
     endpoint = f"{host.rstrip('/')}/indexes/{index_name}/documents"
@@ -279,6 +456,9 @@ def upload_documents(host: str, api_key: str | None, index_name: str, documents:
         return
     for start in range(0, total, batch_size):
         batch = documents[start : start + batch_size]
+        if trace:
+            end = min(start + len(batch), total)
+            print(f"[trace] Uploading batch {start + 1}-{end} of {total} documents.")
         response = http_json("POST", endpoint, batch, api_key, retries=5, retry_delay_seconds=2.0)
         wait_for_task(host, api_key, extract_task_uid(response, "upload-documents"))
 
@@ -287,8 +467,19 @@ def parse_args() -> argparse.Namespace:
     project_root = Path(__file__).resolve().parents[2]
     env_values = load_env(project_root / ".env")
     parser = argparse.ArgumentParser(description="Index HSI-only vectors into Meilisearch.")
-    parser.add_argument("--product-export", type=Path, default=Path(DEFAULT_PRODUCT_EXPORT), help="Product export JSON file.")
+    parser.add_argument(
+        "--product-export",
+        type=Path,
+        default=Path(DEFAULT_PRODUCT_EXPORT),
+        help="Optional product export JSON used to enrich image_name/link/image_url matching.",
+    )
     parser.add_argument("--textures-dir", type=Path, default=Path(DEFAULT_TEXTURE_DIR), help="Directory containing downloaded texture files.")
+    parser.add_argument(
+        "--filter-metadata-export",
+        type=Path,
+        default=Path(DEFAULT_FILTER_METADATA_EXPORT),
+        help="Optional product metadata export used to enrich filter attributes.",
+    )
     parser.add_argument("--mapping-json", type=Path, default=None, help="Optional file-to-product mapping JSON for legacy texture exports.")
     parser.add_argument("--host", default=env_values.get("MEILI_HOST") or os.getenv("MEILI_HOST") or "http://localhost:7700", help="Meilisearch host.")
     parser.add_argument("--key", default=env_values.get("MEILI_KEY") or os.getenv("MEILI_KEY"), help="Meilisearch API key.")
@@ -298,44 +489,86 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--s-bins", type=int, default=16, help="Saturation histogram bins.")
     parser.add_argument("--i-bins", type=int, default=16, help="Intensity histogram bins.")
     parser.add_argument("--batch-size", type=int, default=100, help="Number of documents per Meilisearch upload batch.")
+    parser.add_argument("--trace", dest="trace", action="store_true", help="Print progression traces while indexing.")
+    parser.add_argument("--no-trace", dest="trace", action="store_false", help="Disable progression traces while indexing.")
+    parser.set_defaults(trace=True)
+    parser.add_argument("--trace-every", type=int, default=100, help="Emit progress every N metadata records when --trace is enabled.")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    if not args.product_export.exists():
-        raise FileNotFoundError(f"Product export not found: {args.product_export}")
+    if not args.filter_metadata_export.exists():
+        raise FileNotFoundError(f"Filter metadata export not found: {args.filter_metadata_export}")
     if not args.textures_dir.exists():
         raise FileNotFoundError(f"Textures directory not found: {args.textures_dir}")
     if args.h_bins <= 0 or args.s_bins <= 0 or args.i_bins <= 0:
         raise ValueError("All histogram bin counts must be > 0.")
+    if args.trace_every <= 0:
+        raise ValueError("--trace-every must be > 0.")
 
-    products = load_product_export(args.product_export)
+    metadata_records = load_filter_metadata_export(args.filter_metadata_export)
+    product_records: list[dict[str, Any]] = []
+    if args.product_export.exists():
+        product_records = load_product_export(args.product_export)
+    product_lookup = build_product_export_lookup(product_records)
+
     if args.limit > 0:
-        products = products[: args.limit]
+        metadata_records = metadata_records[: args.limit]
+
+    total_records = len(metadata_records)
+    if args.trace:
+        print(
+            "[trace] Starting HSI indexing "
+            f"(metadata={total_records}, product_export={len(product_records)}, limit={args.limit or 'all'})."
+        )
 
     documents: list[dict[str, Any]] = []
-    skipped = 0
-    for record in products:
-        product_id = record.get("id") or record.get("image_name") or record.get("link") or record.get("image_url")
-        if product_id is None:
-            continue
-        if "id" not in record and product_id is not None:
-            record["id"] = sanitize_meilisearch_id(product_id)
+    skipped_missing_texture = 0
+    skipped_missing_id = 0
+    for index, metadata_record in enumerate(metadata_records, start=1):
+        base_record = resolve_product_export_record(metadata_record, product_lookup)
+        resolved_record = dict(metadata_record)
+        resolved_record.update(base_record)
 
-        texture_path = resolve_texture_path(record, args.textures_dir, args.mapping_json)
+        product_id = (
+            resolved_record.get("id")
+            or resolved_record.get("image_name")
+            or resolved_record.get("link")
+            or resolved_record.get("image_url")
+            or resolved_record.get("previewPath")
+        )
+        if product_id is None:
+            skipped_missing_id += 1
+            if args.trace:
+                print(f"[trace] Skipped {index}/{total_records}: missing id/link/image reference.")
+            continue
+        if "id" not in resolved_record and product_id is not None:
+            resolved_record["id"] = sanitize_meilisearch_id(product_id)
+
+        texture_path = resolve_texture_path(resolved_record, args.textures_dir, args.mapping_json)
         if texture_path is None or not texture_path.exists():
-            skipped += 1
+            skipped_missing_texture += 1
+            if args.trace:
+                current_id = resolved_record.get("id") or product_id
+                print(f"[trace] Skipped {index}/{total_records}: texture not found for '{current_id}'.")
             continue
 
         vector = compute_hsi_histogram(texture_path, args.h_bins, args.s_bins, args.i_bins)
-        documents.append(build_document(record, texture_path, vector))
+        documents.append(build_document(resolved_record, texture_path, vector, metadata_record))
+        if args.trace and (index == 1 or index % args.trace_every == 0 or index == total_records):
+            print(
+                f"[trace] Progress {index}/{total_records}: indexed={len(documents)}, "
+                f"skipped_texture={skipped_missing_texture}, skipped_missing_id={skipped_missing_id}."
+            )
 
     vector_dimensions = len(documents[0]["embedding"]) if documents else None
     ensure_index(args.host, args.key, args.index, vector_dimensions=vector_dimensions)
-    upload_documents(args.host, args.key, args.index, documents, batch_size=args.batch_size)
+    upload_documents(args.host, args.key, args.index, documents, batch_size=args.batch_size, trace=args.trace)
     print(f"Indexed {len(documents)} HSI-only vectors in Meilisearch index '{args.index}'.")
-    print(f"Skipped {skipped} products without a usable texture file.")
+    print(f"Skipped {skipped_missing_texture} products without a usable texture file.")
+    if skipped_missing_id:
+        print(f"Skipped {skipped_missing_id} records without id/link/image reference.")
     return 0
 
 

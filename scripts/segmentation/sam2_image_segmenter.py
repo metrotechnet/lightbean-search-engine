@@ -306,6 +306,38 @@ def remove_small_connected_components(binary_mask: np.ndarray, min_area: int) ->
     return filtered
 
 
+def split_connected_components(binary_mask: np.ndarray) -> list[np.ndarray]:
+    height, width = binary_mask.shape
+    visited = np.zeros_like(binary_mask, dtype=bool)
+    components: list[tuple[int, np.ndarray]] = []
+
+    for y in range(height):
+        for x in range(width):
+            if not binary_mask[y, x] or visited[y, x]:
+                continue
+            stack = [(y, x)]
+            visited[y, x] = True
+            component_mask = np.zeros_like(binary_mask, dtype=bool)
+            area = 0
+
+            while stack:
+                cy, cx = stack.pop()
+                component_mask[cy, cx] = True
+                area += 1
+                for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                    if ny < 0 or ny >= height or nx < 0 or nx >= width:
+                        continue
+                    if visited[ny, nx] or not binary_mask[ny, nx]:
+                        continue
+                    visited[ny, nx] = True
+                    stack.append((ny, nx))
+
+            components.append((area, component_mask))
+
+    components.sort(key=lambda item: item[0], reverse=True)
+    return [component_mask for _, component_mask in components]
+
+
 def build_bright_dark_prompts(
     gray_image: np.ndarray,
     coverage_small: np.ndarray,
@@ -372,6 +404,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.batch_size < 1:
+        raise ValueError(f"--batch-size must be >= 1, got {args.batch_size}")
     if DEFAULT_PROMPT_MAX_COMPONENTS < 1:
         raise ValueError(f"DEFAULT_PROMPT_MAX_COMPONENTS must be >= 1, got {DEFAULT_PROMPT_MAX_COMPONENTS}")
     if DEFAULT_PROMPT_MIN_COMPONENT_AREA < 1:
@@ -408,7 +442,8 @@ def main() -> int:
         "images": [],
     }
 
-    outputs: list[Any] = []
+    image_jobs: list[dict[str, Any]] = []
+    resized_inputs: list[Image.Image] = []
     for image_path in image_paths:
         with Image.open(image_path) as image:
             width, height = image.size
@@ -418,43 +453,92 @@ def main() -> int:
                 f"original={width}x{height} | resized={reduced_size[0]}x{reduced_size[1]}"
             )
             resized_image = image.resize(reduced_size, resample=Image.Resampling.BILINEAR)
-
-            base_output = segmenter(resized_image, batch_size=1)
-            base_regions = extract_regions(base_output)
-            regions: list[dict[str, Any]] = [
-                {"mask": region["mask"], "score": region["score"], "source": "automatic"} for region in base_regions
-            ]
-
-            coverage_small = np.zeros((reduced_size[1], reduced_size[0]), dtype=bool)
-            for base_region in base_regions:
-                coverage_small |= resize_mask(base_region["mask"], (reduced_size[0], reduced_size[1]))
-
-            _, _, prompt_stats, dark_mask_small, bright_mask_small = build_bright_dark_prompts(
-                gray_image=np.asarray(resized_image.convert("L")),
-                coverage_small=coverage_small,
-                max_components=DEFAULT_PROMPT_MAX_COMPONENTS,
-                min_area=DEFAULT_PROMPT_MIN_COMPONENT_AREA,
-            )
-
-            if np.any(dark_mask_small):
-                regions.append({"mask": dark_mask_small, "score": None, "source": "remaining_dark"})
-            if np.any(bright_mask_small):
-                regions.append({"mask": bright_mask_small, "score": None, "source": "remaining_bright"})
-
-            print(
-                f"[sam2] Remaining-area dark/bright for {image_path.name}: "
-                f"remaining={prompt_stats['remaining_pixels']} dark={prompt_stats['dark_remaining_pixels']} "
-                f"bright={prompt_stats['bright_remaining_pixels']}"
-            )
-
-            outputs.append(
+            image_jobs.append(
                 {
-                    "regions": regions,
-                    "prompt_stats": prompt_stats,
-                    "dark_mask_small": dark_mask_small,
-                    "bright_mask_small": bright_mask_small,
+                    "image_path": image_path,
+                    "reduced_size": reduced_size,
+                    "resized_image": resized_image,
                 }
             )
+            resized_inputs.append(resized_image)
+
+    try:
+        batched_outputs = segmenter(resized_inputs, batch_size=args.batch_size)
+    except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
+        if args.batch_size <= 1:
+            raise RuntimeError("SAM2 mask-generation failed with batch_size=1.") from exc
+        print(
+            "[sam2] Batch inference failed; retrying with batch_size=1 for compatibility. "
+            f"Original error: {exc.__class__.__name__}: {exc}"
+        )
+        batched_outputs = segmenter(resized_inputs, batch_size=1)
+    if not isinstance(batched_outputs, list):
+        batched_outputs = [batched_outputs]
+    if len(batched_outputs) != len(image_jobs):
+        raise RuntimeError(
+            f"Unexpected SAM output count: expected {len(image_jobs)} outputs, got {len(batched_outputs)}."
+        )
+
+    outputs: list[Any] = []
+    for job, base_output in zip(image_jobs, batched_outputs):
+        image_path = job["image_path"]
+        reduced_size = job["reduced_size"]
+        resized_image = job["resized_image"]
+
+        base_regions = extract_regions(base_output)
+        regions: list[dict[str, Any]] = [
+            {"mask": region["mask"], "score": region["score"], "source": "automatic"} for region in base_regions
+        ]
+
+        coverage_small = np.zeros((reduced_size[1], reduced_size[0]), dtype=bool)
+        for base_region in base_regions:
+            coverage_small |= resize_mask(base_region["mask"], (reduced_size[0], reduced_size[1]))
+
+        _, _, prompt_stats, dark_mask_small, bright_mask_small = build_bright_dark_prompts(
+            gray_image=np.asarray(resized_image.convert("L")),
+            coverage_small=coverage_small,
+            max_components=DEFAULT_PROMPT_MAX_COMPONENTS,
+            min_area=DEFAULT_PROMPT_MIN_COMPONENT_AREA,
+        )
+
+        dark_components = split_connected_components(dark_mask_small)
+        bright_components = split_connected_components(bright_mask_small)
+
+        for component_index, component_mask in enumerate(dark_components, start=1):
+            regions.append(
+                {
+                    "mask": component_mask,
+                    "score": None,
+                    "source": f"remaining_dark_{component_index:03d}",
+                }
+            )
+        for component_index, component_mask in enumerate(bright_components, start=1):
+            regions.append(
+                {
+                    "mask": component_mask,
+                    "score": None,
+                    "source": f"remaining_bright_{component_index:03d}",
+                }
+            )
+
+        prompt_stats["dark_component_regions"] = len(dark_components)
+        prompt_stats["bright_component_regions"] = len(bright_components)
+
+        print(
+            f"[sam2] Remaining-area dark/bright for {image_path.name}: "
+            f"remaining={prompt_stats['remaining_pixels']} dark={prompt_stats['dark_remaining_pixels']} "
+            f"bright={prompt_stats['bright_remaining_pixels']} dark_regions={prompt_stats['dark_component_regions']} "
+            f"bright_regions={prompt_stats['bright_component_regions']}"
+        )
+
+        outputs.append(
+            {
+                "regions": regions,
+                "prompt_stats": prompt_stats,
+                "dark_mask_small": dark_mask_small,
+                "bright_mask_small": bright_mask_small,
+            }
+        )
 
     for image_path, output_data in zip(image_paths, outputs):
         print(f"[sam2] Segmenting masks for: {image_path.name}")

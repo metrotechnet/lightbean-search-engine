@@ -18,8 +18,10 @@ import cv2
 import numpy as np
 
 
-DEFAULT_SCALES = [0.5, 0.75, 1.0, 1.5]
-DEFAULT_ROTATIONS = [0, 45, 90, 135]
+# DEFAULT_SCALES = [0.5, 0.75, 1.0, 1.5]
+# DEFAULT_ROTATIONS = [0, 45, 90, 135]
+DEFAULT_SCALES = [0.5,  1.0, 1.5]
+DEFAULT_ROTATIONS = [0, 30, -30]
 DEFAULT_PERSPECTIVE_STRENGTH = 0.4
 DEFAULT_PERSPECTIVE_DIRECTION = ["left", "right", "top"]
 DEFAULT_PERSPECTIVE_DIRECTION_TEXT = ",".join(DEFAULT_PERSPECTIVE_DIRECTION)
@@ -317,7 +319,7 @@ def build_contact_sheet(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate scaled + rotated views of a texture image.")
-    parser.add_argument("--input", type=Path, default=Path("texture/main_page"), help="Input texture image path or directory.")
+    parser.add_argument("--input", type=Path, default=Path("texture/main"), help="Input texture image path or directory.")
     parser.add_argument("--output", type=Path, default=Path("texture/views"), help="Output directory for generated views.")
     parser.add_argument("--scales", default=DEFAULT_SCALES_TEXT, help="Comma-separated scale factors.")
     parser.add_argument("--rotations", default=DEFAULT_ROTATIONS_TEXT, help="Comma-separated rotation angles in degrees.")
@@ -395,9 +397,13 @@ def compute_scaled_rotated_views(
     tasks: list[tuple[float, float, str]] = []
     for scale in scales:
         for rotation in rotations:
-            for direction in perspective_directions:
+            if abs(float(rotation)) < 1e-9:
+                selected_directions = list(perspective_directions)
+            else:
+                selected_directions = ["top"]
+            for direction in selected_directions:
                 tasks.append((float(scale), float(rotation), direction))
-
+                
     output: list[dict[str, Any]] = []
     if not tasks:
         return output
