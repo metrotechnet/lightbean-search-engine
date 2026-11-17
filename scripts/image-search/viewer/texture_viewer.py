@@ -22,8 +22,8 @@ from PIL import Image, ImageDraw, ImageTk
 from masked_region_texture_matcher import MaskedRegionTextureMatcher
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-GROUND_TRUTH_PATH = PROJECT_ROOT / "ground_truth.json"
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+GROUND_TRUTH_PATH = PROJECT_ROOT / "data" / "ground_truth.json"
 PRODUCT_EXPORT_PATH = PROJECT_ROOT / "data" / "platform-products-production-v2-en.json"
 FILTER_VALUES_PATH = PROJECT_ROOT / "data" / "product-field-values-readable.json"
 DEFAULT_MATCH_METHOD = "hsi_dinov2"

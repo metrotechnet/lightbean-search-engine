@@ -189,7 +189,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bbox-y1", type=int, help="Optional crop bbox y1 (inclusive) provided by caller.")
     parser.add_argument("--bbox-x2", type=int, help="Optional crop bbox x2 (exclusive) provided by caller.")
     parser.add_argument("--bbox-y2", type=int, help="Optional crop bbox y2 (exclusive) provided by caller.")
-    parser.add_argument("--host", default=env_values.get("MEILI_HOST") or os.getenv("MEILI_HOST"), help="Meilisearch host.")
+    parser.add_argument("--host", default=env_values.get("MEILI_HOST") or os.getenv("MEILI_HOST") or "http://localhost:7700", help="Meilisearch host.")
     parser.add_argument("--key", default=env_values.get("MEILI_KEY") or os.getenv("MEILI_KEY"), help="Meilisearch API key.")
     parser.add_argument("--index", default=env_values.get("MEILI_INDEX") or os.getenv("MEILI_INDEX") or DEFAULT_HSI_DINOV2_INDEX, help="Meilisearch candidate index to search.")
     parser.add_argument(
@@ -666,8 +666,13 @@ class MaskedRegionTextureMatcher:
         log_server_metrics: bool = False,
     ):
         env_values = load_env(PROJECT_ROOT / ".env")
-        self.host = (host or env_values.get("MEILI_HOST") or os.getenv("MEILI_HOST") or DEFAULT_MEILI_HOST).strip()
-        self.api_key = str(api_key).strip() if api_key else None
+        host_value = host or env_values.get("MEILI_HOST") or os.getenv("MEILI_HOST") or "http://localhost:7700"
+        if host_value is None or not str(host_value).strip():
+            raise ValueError("Missing Meilisearch host. Set MEILI_HOST in .env or pass --host.")
+        self.host = str(host_value).strip()
+
+        api_key_value = api_key if api_key is not None else env_values.get("MEILI_KEY") or os.getenv("MEILI_KEY")
+        self.api_key = str(api_key_value).strip() if api_key_value and str(api_key_value).strip() else None
         self.index_name = index_name
         self.method = method
         self.h_bins = h_bins

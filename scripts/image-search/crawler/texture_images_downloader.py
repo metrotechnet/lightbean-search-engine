@@ -61,7 +61,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--output-dir",
-        default="texture",
+        default="texture/main",
         help="Directory where texture files will be saved.",
     )
     parser.add_argument(
